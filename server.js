@@ -5,13 +5,9 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY || "YOUR_API_KEY_HERE";
 
-// ── In-memory price cache ──────────────────────────────────────────────────
 const priceCache = {};
-
-// Tickers to subscribe to
 const TICKERS = ["AAPL", "TSLA", "NVDA", "AMZN", "MSFT", "GME", "AMD", "META"];
 
-// ── Finnhub WebSocket connection ───────────────────────────────────────────
 let ws;
 let wsReady = false;
 
@@ -66,7 +62,6 @@ function connectFinnhub() {
   });
 }
 
-// Seed prevClose
 async function seedPrevClose() {
   for (const ticker of TICKERS) {
     try {
@@ -90,10 +85,10 @@ async function seedPrevClose() {
   }
 }
 
-// ── New: Candles Endpoint ─────────────────────────────────────────────────
+// ── Candles Endpoint ─────────────────────────────────────────────────────
 app.get("/candles", async (req, res) => {
   const ticker = (req.query.ticker || "").toUpperCase();
-  const resolution = req.query.resolution || "5"; // 1,5,15,30,D,W,M
+  const resolution = req.query.resolution || "5";
   const count = parseInt(req.query.count) || 100;
 
   if (!ticker) return res.status(400).json({ error: "ticker param required" });
@@ -105,37 +100,26 @@ app.get("/candles", async (req, res) => {
     const data = await response.json();
     
     if (data.s === "ok") {
-      res.json({
-        ticker,
-        c: data.c,  // close
-        h: data.h,  // high
-        l: data.l,  // low
-        o: data.o,  // open
-        t: data.t,  // timestamp
-        s: data.s
-      });
+      res.json({ ticker, c: data.c, h: data.h, l: data.l, o: data.o, t: data.t });
     } else {
-      res.status(400).json({ error: "No candle data", data });
+      res.status(400).json({ error: "No candle data available", status: data.s });
     }
   } catch (e) {
+    console.error("[CANDLES] Error:", e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
-// ── Existing Routes ───────────────────────────────────────────────────────
+// Existing routes
 app.get("/price", (req, res) => {
   const ticker = (req.query.ticker || "").toUpperCase();
   if (!ticker) return res.status(400).json({ error: "ticker param required" });
-
   const data = priceCache[ticker];
   if (!data) return res.status(404).json({ error: `No data for ${ticker}` });
-
   res.json({ ticker, ...data });
 });
 
-app.get("/prices", (req, res) => {
-  res.json(priceCache);
-});
+app.get("/prices", (req, res) => res.json(priceCache));
 
 app.get("/health", (req, res) => {
   res.json({
@@ -145,10 +129,17 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ── Start Server ─────────────────────────────────────────────────────────
-seedPrevClose().then(() => {
+// Start server properly
+async function startServer() {
+  await seedPrevClose();
   connectFinnhub();
+  
   app.listen(PORT, () => {
     console.log(`[SERVER] Listening on port ${PORT}`);
   });
+}
+
+startServer().catch(err => {
+  console.error("[START] Fatal error:", err);
+  process.exit(1);
 });
