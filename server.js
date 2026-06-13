@@ -10,64 +10,42 @@ const TICKERS = ["AAPL", "TSLA", "NVDA", "AMZN", "MSFT", "GME", "AMD", "META"];
 
 let wsReady = false;
 
-setInterval(() => {}, 20000);
+setInterval(() => {}, 25000);
 
-function connectFinnhub() {
-  const ws = new WebSocket(`wss://ws.finnhub.io?token=${FINNHUB_API_KEY}`);
-
-  ws.on("open", () => {
-    console.log("[WS] Connected to Finnhub");
-    wsReady = true;
-    TICKERS.forEach(t => ws.send(JSON.stringify({ type: "subscribe", symbol: t })));
-  });
-
-  ws.on("message", (raw) => {
-    try {
-      const msg = JSON.parse(raw);
-      if (msg.type === "trade" && msg.data) {
-        msg.data.forEach(trade => {
-          if (trade.s && trade.p !== undefined) {
-            const prev = priceCache[trade.s];
-            priceCache[trade.s] = {
-              price: trade.p,
-              prevClose: prev ? prev.prevClose : trade.p,
-              changePct: prev ? (((trade.p - prev.prevClose) / prev.prevClose) * 100).toFixed(2) : "0.00"
-            };
-          }
-        });
-      }
-    } catch (e) {}
-  });
-
-  ws.on("close", () => {
-    wsReady = false;
-    setTimeout(connectFinnhub, 5000);
-  });
-}
-
-// Seed with real data
-async function seedData() {
+async function seedPrevClose() {
+  console.log("[SEED] Starting...");
   for (const ticker of TICKERS) {
     try {
       const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${FINNHUB_API_KEY}`);
       const data = await res.json();
-      if (data.c) {
+      
+      if (data.c || data.pc) {
         priceCache[ticker] = {
-          price: data.c,
+          price: data.c || data.pc,
           prevClose: data.pc || data.c,
           changePct: data.dp ? data.dp.toFixed(2) : "0.00"
         };
-        console.log(`[SEED] ${ticker} ${data.c}`);
+        console.log(`[SEED] ${ticker} = $${priceCache[ticker].price}`);
       }
-    } catch (e) {}
+    } catch (e) {
+      console.error(`[SEED] ${ticker} failed`, e.message);
+    }
   }
 }
 
+function connectFinnhub() {
+  const ws = new WebSocket(`wss://ws.finnhub.io?token=${FINNHUB_API_KEY}`);
+  ws.on("open", () => {
+    console.log("[WS] Connected");
+    wsReady = true;
+    TICKERS.forEach(t => ws.send(JSON.stringify({ type: "subscribe", symbol: t })));
+  });
+  ws.on("close", () => setTimeout(connectFinnhub, 5000));
+}
+
 // Routes
-app.get("/health", (req, res) => res.json({ status: "ok", wsConnected: wsReady, tickers: Object.keys(priceCache) }));
-
+app.get("/health", (req, res) => res.json({ status: "ok", cached: Object.keys(priceCache) }));
 app.get("/prices", (req, res) => res.json(priceCache));
-
 app.get("/price", (req, res) => {
   const ticker = (req.query.ticker || "").toUpperCase();
   const data = priceCache[ticker];
@@ -76,7 +54,6 @@ app.get("/price", (req, res) => {
 
 app.get("/candles", async (req, res) => {
   const ticker = (req.query.ticker || "").toUpperCase();
-  if (!ticker) return res.status(400).json({ error: "ticker required" });
   try {
     const r = await fetch(`https://finnhub.io/api/v1/stock/candle?symbol=${ticker}&resolution=D&count=30&token=${FINNHUB_API_KEY}`);
     const data = await r.json();
@@ -87,7 +64,7 @@ app.get("/candles", async (req, res) => {
 });
 
 async function start() {
-  await seedData();
+  await seedPrevClose();
   connectFinnhub();
   app.listen(PORT, () => console.log(`[SERVER] Ready on ${PORT}`));
 }
