@@ -11,13 +11,16 @@ const TICKERS = ["AAPL", "TSLA", "NVDA", "AMZN", "MSFT", "GME", "AMD", "META"];
 let ws;
 let wsReady = false;
 
+// Keep process alive for Railway
+setInterval(() => {}, 30000); // Simple heartbeat
+
 function connectFinnhub() {
   ws = new WebSocket(`wss://ws.finnhub.io?token=${FINNHUB_API_KEY}`);
 
   ws.on("open", () => {
     console.log("[WS] Connected to Finnhub");
     wsReady = true;
-    TICKERS.forEach((ticker) => {
+    TICKERS.forEach(ticker => {
       ws.send(JSON.stringify({ type: "subscribe", symbol: ticker }));
       console.log(`[WS] Subscribed to ${ticker}`);
     });
@@ -27,7 +30,7 @@ function connectFinnhub() {
     try {
       const msg = JSON.parse(raw);
       if (msg.type === "trade" && msg.data) {
-        msg.data.forEach((trade) => {
+        msg.data.forEach(trade => {
           const symbol = trade.s;
           const price = trade.p;
           if (symbol && price) {
@@ -76,7 +79,7 @@ async function seedPrevClose() {
   }
 }
 
-// === Candles Endpoint ===
+// Routes
 app.get("/candles", async (req, res) => {
   const ticker = (req.query.ticker || "").toUpperCase();
   const resolution = req.query.resolution || "5";
@@ -110,21 +113,13 @@ app.get("/prices", (req, res) => res.json(priceCache));
 
 app.get("/health", (req, res) => res.json({ status: "ok", wsConnected: wsReady }));
 
-// === Start Server ===
+// Start
 async function start() {
   await seedPrevClose();
   connectFinnhub();
   app.listen(PORT, () => {
-    console.log(`[SERVER] Listening on port ${PORT} - Ready for Roblox!`);
+    console.log(`[SERVER] ✅ Listening on port ${PORT} - Ready for Roblox!`);
   });
 }
 
-start().catch(err => {
-  console.error("[FATAL ERROR]", err);
-});
-
-// Keep process alive
-process.on('SIGTERM', () => {
-  console.log("[RAILWAY] SIGTERM received - shutting down gracefully");
-  process.exit(0);
-});
+start().catch(err => console.error("[FATAL]", err));
