@@ -6,10 +6,9 @@ const PORT = process.env.PORT || 3000;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY || "YOUR_API_KEY_HERE";
 
 // ── In-memory price cache ──────────────────────────────────────────────────
-// { "AAPL": { price: 213.45, prevClose: 210.00, timestamp: 1718000000000 } }
 const priceCache = {};
 
-// Tickers to subscribe to — edit this list freely
+// Tickers to subscribe to
 const TICKERS = ["AAPL", "TSLA", "NVDA", "AMZN", "MSFT", "GME", "AMD", "META"];
 
 // ── Finnhub WebSocket connection ───────────────────────────────────────────
@@ -22,7 +21,6 @@ function connectFinnhub() {
   ws.on("open", () => {
     console.log("[WS] Connected to Finnhub");
     wsReady = true;
-    // Subscribe to each ticker
     TICKERS.forEach((ticker) => {
       ws.send(JSON.stringify({ type: "subscribe", symbol: ticker }));
       console.log(`[WS] Subscribed to ${ticker}`);
@@ -68,7 +66,7 @@ function connectFinnhub() {
   });
 }
 
-// Seed prevClose via REST on startup so change% is accurate from the start
+// Seed prevClose
 async function seedPrevClose() {
   for (const ticker of TICKERS) {
     try {
@@ -92,9 +90,39 @@ async function seedPrevClose() {
   }
 }
 
-// ── Routes ─────────────────────────────────────────────────────────────────
+// ── New: Candles Endpoint ─────────────────────────────────────────────────
+app.get("/candles", async (req, res) => {
+  const ticker = (req.query.ticker || "").toUpperCase();
+  const resolution = req.query.resolution || "5"; // 1,5,15,30,D,W,M
+  const count = parseInt(req.query.count) || 100;
 
-// Single ticker:  GET /price?ticker=AAPL
+  if (!ticker) return res.status(400).json({ error: "ticker param required" });
+
+  try {
+    const response = await fetch(
+      `https://finnhub.io/api/v1/stock/candle?symbol=${ticker}&resolution=${resolution}&count=${count}&token=${FINNHUB_API_KEY}`
+    );
+    const data = await response.json();
+    
+    if (data.s === "ok") {
+      res.json({
+        ticker,
+        c: data.c,  // close
+        h: data.h,  // high
+        l: data.l,  // low
+        o: data.o,  // open
+        t: data.t,  // timestamp
+        s: data.s
+      });
+    } else {
+      res.status(400).json({ error: "No candle data", data });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Existing Routes ───────────────────────────────────────────────────────
 app.get("/price", (req, res) => {
   const ticker = (req.query.ticker || "").toUpperCase();
   if (!ticker) return res.status(400).json({ error: "ticker param required" });
@@ -105,12 +133,10 @@ app.get("/price", (req, res) => {
   res.json({ ticker, ...data });
 });
 
-// All tickers:    GET /prices
 app.get("/prices", (req, res) => {
   res.json(priceCache);
 });
 
-// Health check:   GET /health
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
@@ -119,7 +145,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ── Start ──────────────────────────────────────────────────────────────────
+// ── Start Server ─────────────────────────────────────────────────────────
 seedPrevClose().then(() => {
   connectFinnhub();
   app.listen(PORT, () => {
