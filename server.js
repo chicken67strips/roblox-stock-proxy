@@ -36,9 +36,7 @@ function connectFinnhub() {
               price: price,
               prevClose: prev ? prev.prevClose || price : price,
               change: prev ? price - (prev.prevClose || price) : 0,
-              changePct: prev && prev.prevClose
-                ? (((price - prev.prevClose) / prev.prevClose) * 100).toFixed(2)
-                : "0.00",
+              changePct: prev && prev.prevClose ? (((price - prev.prevClose) / prev.prevClose) * 100).toFixed(2) : "0.00",
               timestamp: trade.t,
             };
           }
@@ -49,11 +47,7 @@ function connectFinnhub() {
     }
   });
 
-  ws.on("error", (err) => {
-    console.error("[WS] Error:", err.message);
-    wsReady = false;
-  });
-
+  ws.on("error", (err) => console.error("[WS] Error:", err.message));
   ws.on("close", () => {
     console.log("[WS] Disconnected — reconnecting in 5s...");
     wsReady = false;
@@ -82,7 +76,7 @@ async function seedPrevClose() {
   }
 }
 
-// Candles Route
+// === Candles Endpoint ===
 app.get("/candles", async (req, res) => {
   const ticker = (req.query.ticker || "").toUpperCase();
   const resolution = req.query.resolution || "5";
@@ -91,14 +85,12 @@ app.get("/candles", async (req, res) => {
   if (!ticker) return res.status(400).json({ error: "ticker required" });
 
   try {
-    const response = await fetch(
-      `https://finnhub.io/api/v1/stock/candle?symbol=${ticker}&resolution=${resolution}&count=${count}&token=${FINNHUB_API_KEY}`
-    );
+    const response = await fetch(`https://finnhub.io/api/v1/stock/candle?symbol=${ticker}&resolution=${resolution}&count=${count}&token=${FINNHUB_API_KEY}`);
     const data = await response.json();
     if (data.s === "ok") {
       res.json({ ticker, c: data.c, h: data.h, l: data.l, o: data.o, t: data.t });
     } else {
-      res.status(400).json({ error: "No data", status: data.s });
+      res.status(400).json({ error: "No candle data" });
     }
   } catch (e) {
     console.error("[CANDLES] Error:", e.message);
@@ -116,17 +108,23 @@ app.get("/price", (req, res) => {
 
 app.get("/prices", (req, res) => res.json(priceCache));
 
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", wsConnected: wsReady, cachedTickers: Object.keys(priceCache) });
-});
+app.get("/health", (req, res) => res.json({ status: "ok", wsConnected: wsReady }));
 
-// Start the server
+// === Start Server ===
 async function start() {
   await seedPrevClose();
   connectFinnhub();
   app.listen(PORT, () => {
-    console.log(`[SERVER] Listening on port ${PORT}`);
+    console.log(`[SERVER] Listening on port ${PORT} - Ready for Roblox!`);
   });
 }
 
-start().catch(err => console.error("[FATAL]", err));
+start().catch(err => {
+  console.error("[FATAL ERROR]", err);
+});
+
+// Keep process alive
+process.on('SIGTERM', () => {
+  console.log("[RAILWAY] SIGTERM received - shutting down gracefully");
+  process.exit(0);
+});
