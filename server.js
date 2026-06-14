@@ -6,7 +6,14 @@ const PORT = process.env.PORT || 8080;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 
 const priceCache = {};
-const TICKERS = ["AAPL", "TSLA", "NVDA", "AMZN", "MSFT", "GME", "AMD", "META"];
+const TICKERS = [
+  // Mega-cap
+  "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "BRK.B", "AVGO", "LLY", "JPM", "V", "WMT", "UNH", "XOM",
+  // Mid/Large-cap
+  "AMD", "NFLX", "CRM", "ADBE", "ORCL", "COST", "DIS", "BA", "NKE", "PYPL", "INTC", "UBER", "ABNB", "SBUX", "KO",
+  // Small-cap
+  "MASK", "MNTS", "DSY", "INHD", "CLDI", "AZI", "DXST", "WCT", "AIXI", "CODX", "GOVX", "CHAI", "CDLX", "DCX", "CLPR"
+];
 
 let wsReady = false;
 
