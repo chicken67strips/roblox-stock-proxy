@@ -6,12 +6,12 @@ const PORT = process.env.PORT || 8080;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 
 const priceCache = {};
-const TICKERS = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD", /* add the rest you want */];
+const TICKERS = ["AAPL", "TSLA", "NVDA", "AMZN", "MSFT", "GME", "AMD", "META"];
 
 let wsReady = false;
 
-async function seedPrevClose() {
-  console.log("[SEED] Starting...");
+async function seedPrices() {
+  console.log("[SEED] Fetching latest prices...");
   for (const ticker of TICKERS) {
     try {
       const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${FINNHUB_API_KEY}`);
@@ -34,9 +34,11 @@ function connectFinnhub() {
   const ws = new WebSocket(`wss://ws.finnhub.io?token=${FINNHUB_API_KEY}`);
 
   ws.on("open", () => {
-    console.log("[WS] Connected to Finnhub");
+    console.log("[WS] Connected - Subscribing to tickers");
     wsReady = true;
-    TICKERS.forEach(t => ws.send(JSON.stringify({ type: "subscribe", symbol: t })));
+    TICKERS.forEach(t => {
+      ws.send(JSON.stringify({ type: "subscribe", symbol: t }));
+    });
   });
 
   ws.on("message", (raw) => {
@@ -61,37 +63,29 @@ function connectFinnhub() {
 
   ws.on("close", () => {
     wsReady = false;
-    setTimeout(connectFinnhub, 5000);
+    console.log("[WS] Disconnected, reconnecting...");
+    setTimeout(connectFinnhub, 3000);
   });
 }
 
 // Routes
-app.get("/health", (req, res) => res.json({ status: "ok", wsReady, count: Object.keys(priceCache).length }));
-
 app.get("/prices", (req, res) => res.json(priceCache));
-
 app.get("/price", (req, res) => {
   const ticker = (req.query.ticker || "").toUpperCase();
   const data = priceCache[ticker];
   res.json(data ? { ticker, ...data } : { error: "No data" });
 });
 
-app.get("/candles", async (req, res) => {
-  const ticker = (req.query.ticker || "").toUpperCase();
-  const resolution = req.query.resolution || "5";
-  try {
-    const r = await fetch(`https://finnhub.io/api/v1/stock/candle?symbol=${ticker}&resolution=${resolution}&count=60&token=${FINNHUB_API_KEY}`);
-    const data = await r.json();
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+app.get("/health", (req, res) => res.json({ 
+  status: "ok", 
+  wsReady, 
+  tickers: Object.keys(priceCache).length 
+}));
 
 async function start() {
-  await seedPrevClose();
+  await seedPrices();
   connectFinnhub();
-  app.listen(PORT, () => console.log(`[SERVER] Ready on ${PORT}`));
+  app.listen(PORT, () => console.log(`[SERVER] Ready on port ${PORT}`));
 }
 
 start();
