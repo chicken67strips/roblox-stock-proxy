@@ -252,10 +252,42 @@ app.get("/price", (req, res) => {
 });
 app.get("/candles", async (req, res) => {
   const ticker = (req.query.ticker || "").toUpperCase();
+  const interval = req.query.interval || "1min";
+
+  // Map frontend intervals to Twelve Data intervals
+  const intervalMap = {
+    "1m": "1min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1h": "1h",
+    "1d": "1day"
+  };
+  const tdInterval = intervalMap[interval] || interval;
+
+  // Candle counts per timeframe (60 candles each)
+  const outputsize = 60;
+
   try {
-    const r = await fetch(`https://finnhub.io/api/v1/stock/candle?symbol=${ticker}&resolution=D&count=30&token=${FINNHUB_API_KEY}`);
+    const url = `https://api.twelvedata.com/time_series?symbol=${ticker}&interval=${tdInterval}&outputsize=${outputsize}&apikey=${TWELVE_DATA_API_KEY}`;
+    const r = await fetch(url);
     const data = await r.json();
-    res.json(data);
+
+    if (data.status === "error" || !data.values) {
+      return res.json({ error: data.message || "No data" });
+    }
+
+    // Normalize to simple OHLC array, oldest first
+    const candles = data.values.reverse().map(v => ({
+      t: v.datetime,
+      o: parseFloat(v.open),
+      h: parseFloat(v.high),
+      l: parseFloat(v.low),
+      c: parseFloat(v.close),
+      v: parseFloat(v.volume)
+    }));
+
+    res.json({ ticker, interval: tdInterval, candles });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
