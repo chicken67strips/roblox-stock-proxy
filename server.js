@@ -232,6 +232,51 @@ function startTwelveDataPolling() {
 }
 
 // ============================
+// Candle cache
+// Shared across ALL players hitting this proxy. Without this, every popup
+// open / timeframe click / 15s auto-refresh from every player was a fresh
+// Twelve Data credit, even when 50 players were all looking at the same
+// AAPL 1m chart at the same time. Now they all share one cached response
+// per ticker+interval until it goes stale.
+//
+// TTL is matched to how meaningful a fresher candle actually is per
+// timeframe — no point spending a credit refreshing 1-day candles every
+// 30 seconds, and even 1-minute candles don't need to be fetched faster
+// than the client's own 15s auto-refresh cycle.
+// ============================
+const candleCache = {}; // key: "TICKER:interval" -> { data, fetchedAt }
+
+const CANDLE_TTL_MS = {
+  "1min": 20 * 1000,
+  "5min": 60 * 1000,
+  "15min": 3 * 60 * 1000,
+  "30min": 5 * 60 * 1000,
+  "1h": 10 * 60 * 1000,
+  "1day": 60 * 60 * 1000
+};
+const DEFAULT_CANDLE_TTL_MS = 60 * 1000;
+
+let twelveDataCandleCreditsUsedToday = 0; // tracked separately for visibility in /health
+
+function getCandleTTL(interval) {
+  return CANDLE_TTL_MS[interval] || DEFAULT_CANDLE_TTL_MS;
+}
+
+function getCachedCandles(ticker, interval) {
+  const key = `${ticker}:${interval}`;
+  const entry = candleCache[key];
+  if (!entry) return null;
+  const age = Date.now() - entry.fetchedAt;
+  if (age > getCandleTTL(interval)) return null;
+  return entry.data;
+}
+
+function setCachedCandles(ticker, interval, data) {
+  const key = `${ticker}:${interval}`;
+  candleCache[key] = { data, fetchedAt: Date.now() };
+}
+
+// ============================
 // Routes
 // ============================
 app.get("/health", (req, res) => res.json({
@@ -241,6 +286,8 @@ app.get("/health", (req, res) => res.json({
   lastWsTradeMsAgo: Date.now() - lastWsTradeTime,
   cached: Object.keys(priceCache).length,
   twelveDataCreditsUsedToday,
+  twelveDataCandleCreditsUsedToday,
+  candleCacheEntries: Object.keys(candleCache).length,
   isRegularMarketHours: isRegularMarketHours(),
   isExtendedHours: isExtendedHours()
 }));
@@ -265,6 +312,13 @@ app.get("/candles", async (req, res) => {
   };
   const tdInterval = intervalMap[interval] || interval;
 
+  // Serve from cache if it's still fresh. This is the part that makes N
+  // players watching the same ticker/timeframe cost 1 credit instead of N.
+  const cached = getCachedCandles(ticker, tdInterval);
+  if (cached) {
+    return res.json({ ticker, interval: tdInterval, candles: cached, cached: true });
+  }
+
   // Candle counts per timeframe (60 candles each)
   const outputsize = 60;
 
@@ -274,6 +328,8 @@ app.get("/candles", async (req, res) => {
     const data = await r.json();
 
     if (data.status === "error" || !data.values) {
+      // Don't cache errors - let the next request try again rather than
+      // pinning a failure in place for the full TTL window.
       return res.json({ error: data.message || "No data" });
     }
 
@@ -286,6 +342,9 @@ app.get("/candles", async (req, res) => {
       c: parseFloat(v.close),
       v: parseFloat(v.volume)
     }));
+
+    setCachedCandles(ticker, tdInterval, candles);
+    twelveDataCandleCreditsUsedToday++;
 
     res.json({ ticker, interval: tdInterval, candles });
   } catch (e) {
