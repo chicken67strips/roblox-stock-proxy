@@ -77,6 +77,102 @@ async function seedPrevClose() {
 }
 
 // ============================
+// Twelve Data Rate Limiter / Queue
+// Free tier allows 8 requests/min AND 800/day. These are two separate
+// buckets that get hit independently - the daily one is handled below via
+// twelveDataCreditsUsedToday / MAX_CREDITS_PER_DAY, this section handles
+// the per-minute one.
+//
+// Every Twelve Data call in this file (background quote polling AND the
+// /candles endpoint) goes through this single shared queue instead of
+// calling fetch() directly. Without this, N players cache-missing on N
+// different tickers at the same moment - or a candle request landing at
+// the same instant as a background poll batch - can each fire a separate
+// HTTP request and blow through 8/min even though caching prevents
+// blowing through the daily cap.
+//
+// Sliding window (not fixed-window) so bursts right at a minute boundary
+// don't slip through. Capped at 7/min, one under the real limit, as a
+// buffer for clock drift / in-flight requests.
+//
+// Candle requests are prioritized over background quote polling - a
+// candle request means a player is actively staring at a loading
+// spinner; the background poll can wait a few extra seconds with nobody
+// noticing.
+// ============================
+const TD_MAX_PER_MINUTE = 7;
+const TD_WINDOW_MS = 60 * 1000;
+const TD_QUEUE_TIMEOUT_MS = 30 * 1000; // give up waiting and reject after 30s
+const TD_MAX_QUEUE_LENGTH = 60; // hard cap so a flood can't pile up unbounded
+const TD_PRIORITY = { candle: 0, quote: 1 }; // lower number = served first
+
+const tdCallTimestamps = []; // ms timestamps of calls sent within the last window
+const tdQueue = []; // { url, resolve, reject, priority, enqueuedAt }
+
+function tdPruneTimestamps(now) {
+  const cutoff = now - TD_WINDOW_MS;
+  while (tdCallTimestamps.length && tdCallTimestamps[0] < cutoff) {
+    tdCallTimestamps.shift();
+  }
+}
+
+function tdCanSendNow(now) {
+  tdPruneTimestamps(now);
+  return tdCallTimestamps.length < TD_MAX_PER_MINUTE;
+}
+
+function tdProcessQueue() {
+  const now = Date.now();
+
+  // Drop anything that's been waiting too long - whoever wanted it has
+  // likely moved on (player closed the popup, switched timeframe, etc),
+  // and firing it late just wastes a credit on a response nobody reads.
+  for (let i = tdQueue.length - 1; i >= 0; i--) {
+    if (now - tdQueue[i].enqueuedAt > TD_QUEUE_TIMEOUT_MS) {
+      const stale = tdQueue.splice(i, 1)[0];
+      stale.reject(new Error("Twelve Data request timed out waiting in queue"));
+    }
+  }
+
+  if (tdQueue.length === 0) return;
+
+  // Highest priority (lowest number) first, then oldest first within a
+  // priority tier. Safe to sort once here since nothing else can push
+  // into tdQueue during this synchronous pass.
+  tdQueue.sort((a, b) => a.priority - b.priority || a.enqueuedAt - b.enqueuedAt);
+
+  while (tdQueue.length > 0 && tdCanSendNow(Date.now())) {
+    const job = tdQueue.shift();
+    tdCallTimestamps.push(Date.now());
+    fetch(job.url)
+      .then(r => r.json())
+      .then(data => job.resolve(data))
+      .catch(err => job.reject(err));
+  }
+}
+
+setInterval(tdProcessQueue, 200);
+
+function tdRequest(url, priority) {
+  return new Promise((resolve, reject) => {
+    if (tdQueue.length >= TD_MAX_QUEUE_LENGTH) {
+      reject(new Error("Twelve Data request queue is full, try again shortly"));
+      return;
+    }
+    tdQueue.push({ url, resolve, reject, priority, enqueuedAt: Date.now() });
+  });
+}
+
+function tdQueueDepth() {
+  return tdQueue.length;
+}
+
+function tdCallsInLastMinute() {
+  tdPruneTimestamps(Date.now());
+  return tdCallTimestamps.length;
+}
+
+// ============================
 // Twelve Data polling (extended hours)
 // Batches of 8 tickers per call to stay under free tier limits
 // Only runs during extended hours when Finnhub WS is quiet
@@ -113,8 +209,7 @@ async function pollTwelveDataBatch() {
   try {
     const symbols = batch.join(",");
     const url = `https://api.twelvedata.com/quote?symbol=${symbols}&apikey=${TWELVE_DATA_API_KEY}`;
-    const res = await fetch(url);
-    const data = await res.json();
+    const data = await tdRequest(url, TD_PRIORITY.quote);
 
     // Response is either a single object (1 ticker) or a dict keyed by ticker
     const results = batch.length === 1 ? { [batch[0]]: data } : data;
@@ -287,6 +382,8 @@ app.get("/health", (req, res) => res.json({
   cached: Object.keys(priceCache).length,
   twelveDataCreditsUsedToday,
   twelveDataCandleCreditsUsedToday,
+  twelveDataQueueDepth: tdQueueDepth(),
+  twelveDataCallsInLastMinute: tdCallsInLastMinute(),
   candleCacheEntries: Object.keys(candleCache).length,
   isRegularMarketHours: isRegularMarketHours(),
   isExtendedHours: isExtendedHours()
@@ -321,11 +418,12 @@ app.get("/candles", async (req, res) => {
 
   // Candle counts per timeframe (60 candles each)
   const outputsize = 60;
+  const url = `https://api.twelvedata.com/time_series?symbol=${ticker}&interval=${tdInterval}&outputsize=${outputsize}&apikey=${TWELVE_DATA_API_KEY}`;
 
   try {
-    const url = `https://api.twelvedata.com/time_series?symbol=${ticker}&interval=${tdInterval}&outputsize=${outputsize}&apikey=${TWELVE_DATA_API_KEY}`;
-    const r = await fetch(url);
-    const data = await r.json();
+    // Routed through the shared rate-limited queue (TD_PRIORITY.candle) so
+    // this can never combine with background polling to exceed 8/min.
+    const data = await tdRequest(url, TD_PRIORITY.candle);
 
     if (data.status === "error" || !data.values) {
       // Don't cache errors - let the next request try again rather than
@@ -348,7 +446,13 @@ app.get("/candles", async (req, res) => {
 
     res.json({ ticker, interval: tdInterval, candles });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    // Always respond 200 with an {error} field rather than a non-2xx
+    // status. Roblox's HttpService:GetAsync throws on non-2xx, which the
+    // server's pcall catches and turns into a generic "Network error"
+    // message - that would swallow useful messages like the queue-timeout
+    // / queue-full ones below. Keeping this 200 lets the real message
+    // reach the client's "Chart unavailable: ..." label.
+    res.json({ error: e.message });
   }
 });
 
