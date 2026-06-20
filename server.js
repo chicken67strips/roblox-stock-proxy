@@ -99,10 +99,20 @@ async function seedPrevClose() {
 // candle request means a player is actively staring at a loading
 // spinner; the background poll can wait a few extra seconds with nobody
 // noticing.
+//
+// TIMEOUT MUST EXCEED THE WINDOW: when a burst of requests arrives all at
+// once, the first 7 get sent immediately and stamped with ~the same
+// timestamp. Everything past #7 has to wait for THOSE 7 stamps to age out
+// of the 60s sliding window before a slot frees up - and because they're
+// nearly identical timestamps, they don't free up one at a time, they all
+// expire together around the 60s mark. So a queued request only ever needs
+// to survive to ~60s, but a timeout shorter than 60s (the old 30s value)
+// guarantees it gets evicted before that slot ever opens. 90s gives margin
+// above the 60s worst case.
 // ============================
 const TD_MAX_PER_MINUTE = 7;
 const TD_WINDOW_MS = 60 * 1000;
-const TD_QUEUE_TIMEOUT_MS = 30 * 1000; // give up waiting and reject after 30s
+const TD_QUEUE_TIMEOUT_MS = 90 * 1000; // must exceed TD_WINDOW_MS - see note above
 const TD_MAX_QUEUE_LENGTH = 60; // hard cap so a flood can't pile up unbounded
 const TD_PRIORITY = { candle: 0, quote: 1 }; // lower number = served first
 
@@ -416,8 +426,13 @@ app.get("/candles", async (req, res) => {
     return res.json({ ticker, interval: tdInterval, candles: cached, cached: true });
   }
 
-  // Candle counts per timeframe (60 candles each)
-  const outputsize = 60;
+  // Fetch the full 200-candle window in one shot per ticker+interval.
+  // Twelve Data bills 1 credit per /time_series call regardless of
+  // outputsize, so this costs exactly the same as the old 60 - the extra
+  // candles are "free" and let the client scroll/pan through history
+  // entirely from data it already has in memory, with zero additional
+  // server requests.
+  const outputsize = 200;
   const url = `https://api.twelvedata.com/time_series?symbol=${ticker}&interval=${tdInterval}&outputsize=${outputsize}&apikey=${TWELVE_DATA_API_KEY}`;
 
   try {
