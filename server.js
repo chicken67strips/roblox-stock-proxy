@@ -80,46 +80,15 @@ async function seedPrevClose() {
 
 // ============================
 // Twelve Data Rate Limiter / Queue
-// Free tier allows 8 requests/min AND 800/day. These are two separate
-// buckets that get hit independently - the daily one is handled below via
-// twelveDataCreditsUsedToday / MAX_CREDITS_PER_DAY, this section handles
-// the per-minute one.
-//
-// Every Twelve Data call in this file (background quote polling AND the
-// /candles endpoint) goes through this single shared queue instead of
-// calling fetch() directly. Without this, N players cache-missing on N
-// different tickers at the same moment - or a candle request landing at
-// the same instant as a background poll batch - can each fire a separate
-// HTTP request and blow through 8/min even though caching prevents
-// blowing through the daily cap.
-//
-// Sliding window (not fixed-window) so bursts right at a minute boundary
-// don't slip through. Capped at 7/min, one under the real limit, as a
-// buffer for clock drift / in-flight requests.
-//
-// Candle requests are prioritized over background quote polling - a
-// candle request means a player is actively staring at a loading
-// spinner; the background poll can wait a few extra seconds with nobody
-// noticing.
-//
-// TIMEOUT MUST EXCEED THE WINDOW: when a burst of requests arrives all at
-// once, the first 7 get sent immediately and stamped with ~the same
-// timestamp. Everything past #7 has to wait for THOSE 7 stamps to age out
-// of the 60s sliding window before a slot frees up - and because they're
-// nearly identical timestamps, they don't free up one at a time, they all
-// expire together around the 60s mark. So a queued request only ever needs
-// to survive to ~60s, but a timeout shorter than 60s (the old 30s value)
-// guarantees it gets evicted before that slot ever opens. 90s gives margin
-// above the 60s worst case.
 // ============================
 const TD_MAX_PER_MINUTE = 7;
 const TD_WINDOW_MS = 60 * 1000;
-const TD_QUEUE_TIMEOUT_MS = 90 * 1000; // must exceed TD_WINDOW_MS - see note above
-const TD_MAX_QUEUE_LENGTH = 60; // hard cap so a flood can't pile up unbounded
-const TD_PRIORITY = { candle: 0, quote: 1 }; // lower number = served first
+const TD_QUEUE_TIMEOUT_MS = 90 * 1000;
+const TD_MAX_QUEUE_LENGTH = 60;
+const TD_PRIORITY = { candle: 0, quote: 1 };
 
-const tdCallTimestamps = []; // ms timestamps of calls sent within the last window
-const tdQueue = []; // { url, resolve, reject, priority, enqueuedAt }
+const tdCallTimestamps = [];
+const tdQueue = [];
 
 function tdPruneTimestamps(now) {
   const cutoff = now - TD_WINDOW_MS;
@@ -136,9 +105,6 @@ function tdCanSendNow(now) {
 function tdProcessQueue() {
   const now = Date.now();
 
-  // Drop anything that's been waiting too long - whoever wanted it has
-  // likely moved on (player closed the popup, switched timeframe, etc),
-  // and firing it late just wastes a credit on a response nobody reads.
   for (let i = tdQueue.length - 1; i >= 0; i--) {
     if (now - tdQueue[i].enqueuedAt > TD_QUEUE_TIMEOUT_MS) {
       const stale = tdQueue.splice(i, 1)[0];
@@ -148,9 +114,6 @@ function tdProcessQueue() {
 
   if (tdQueue.length === 0) return;
 
-  // Highest priority (lowest number) first, then oldest first within a
-  // priority tier. Safe to sort once here since nothing else can push
-  // into tdQueue during this synchronous pass.
   tdQueue.sort((a, b) => a.priority - b.priority || a.enqueuedAt - b.enqueuedAt);
 
   while (tdQueue.length > 0 && tdCanSendNow(Date.now())) {
@@ -185,15 +148,13 @@ function tdCallsInLastMinute() {
 }
 
 // ============================
-// Twelve Data polling (extended hours)
-// Batches of 8 tickers per call to stay under free tier limits
-// Only runs during extended hours when Finnhub WS is quiet
+// Twelve Data polling
 // ============================
 const BATCH_SIZE = 8;
 let twelveDataBatchIndex = 0;
 let twelveDataCreditsUsedToday = 0;
 let lastCreditReset = new Date().toDateString();
-const MAX_CREDITS_PER_DAY = 750; // Leave 50 buffer below 800 limit
+const MAX_CREDITS_PER_DAY = 750;
 
 function resetCreditsIfNewDay() {
   const today = new Date().toDateString();
@@ -223,7 +184,6 @@ async function pollTwelveDataBatch() {
     const url = `https://api.twelvedata.com/quote?symbol=${symbols}&apikey=${TWELVE_DATA_API_KEY}`;
     const data = await tdRequest(url, TD_PRIORITY.quote);
 
-    // Response is either a single object (1 ticker) or a dict keyed by ticker
     const results = batch.length === 1 ? { [batch[0]]: data } : data;
 
     let updated = 0;
@@ -249,7 +209,7 @@ async function pollTwelveDataBatch() {
 }
 
 // ============================
-// Finnhub WebSocket (regular hours live trades)
+// Finnhub WebSocket
 // ============================
 function handleTradeMessage(msg) {
   if (msg.type !== "trade" || !Array.isArray(msg.data)) return;
@@ -296,14 +256,14 @@ setInterval(() => {
 }, 25000);
 
 // ============================
-// Finnhub REST fallback (staggered, only when WS quiet during regular hours)
+// Finnhub REST fallback
 // ============================
 let finnhubTickerIndex = 0;
 function startFinnhubRestPolling() {
   setInterval(() => {
     const wsIsQuiet = (Date.now() - lastWsTradeTime) > WS_QUIET_THRESHOLD_MS;
     if (!wsIsQuiet) return;
-    if (!isRegularMarketHours()) return; // Let Twelve Data handle extended hours
+    if (!isRegularMarketHours()) return;
 
     const ticker = TICKERS[finnhubTickerIndex % TICKERS.length];
     finnhubTickerIndex++;
@@ -323,35 +283,20 @@ function startFinnhubRestPolling() {
   }, 1400);
 }
 
-// ============================
-// Twelve Data polling loop (extended hours only, every 2 minutes per batch)
-// Full cycle = ceil(45/8) = 6 batches × 2 min = 12 min per full cycle
-// Credits per full cycle = 45, per day max = 750 / 45 = 16 full cycles = fine
-// ============================
 function startTwelveDataPolling() {
   setInterval(() => {
     const wsIsQuiet = (Date.now() - lastWsTradeTime) > WS_QUIET_THRESHOLD_MS;
-    if (!wsIsQuiet) return; // Finnhub WS is active, no need
-    if (!isExtendedHours() && !isRegularMarketHours()) return; // Dead zone, skip
+    if (!wsIsQuiet) return;
+    if (!isExtendedHours() && !isRegularMarketHours()) return;
 
     pollTwelveDataBatch();
-  }, 2 * 60 * 1000); // Every 2 minutes
+  }, 2 * 60 * 1000);
 }
 
 // ============================
-// Candle cache
-// Shared across ALL players hitting this proxy. Without this, every popup
-// open / timeframe click / 15s auto-refresh from every player was a fresh
-// Twelve Data credit, even when 50 players were all looking at the same
-// AAPL 1m chart at the same time. Now they all share one cached response
-// per ticker+interval until it goes stale.
-//
-// TTL is matched to how meaningful a fresher candle actually is per
-// timeframe — no point spending a credit refreshing 1-day candles every
-// 30 seconds, and even 1-minute candles don't need to be fetched faster
-// than the client's own 15s auto-refresh cycle.
+// Stock candle cache
 // ============================
-const candleCache = {}; // key: "TICKER:interval" -> { data, fetchedAt }
+const candleCache = {};
 
 const CANDLE_TTL_MS = {
   "1min": 20 * 1000,
@@ -363,7 +308,7 @@ const CANDLE_TTL_MS = {
 };
 const DEFAULT_CANDLE_TTL_MS = 60 * 1000;
 
-let twelveDataCandleCreditsUsedToday = 0; // tracked separately for visibility in /health
+let twelveDataCandleCreditsUsedToday = 0;
 
 function getCandleTTL(interval) {
   return CANDLE_TTL_MS[interval] || DEFAULT_CANDLE_TTL_MS;
@@ -383,14 +328,13 @@ function setCachedCandles(ticker, interval, data) {
   candleCache[key] = { data, fetchedAt: Date.now() };
 }
 
-
 // ============================
-// Crypto price cache (FreeCryptoAPI first, CoinGecko fallback)
+// Crypto price cache
 // ============================
 const CRYPTO_SYMBOLS = ["BTC", "ETH", "SOL", "DOGE", "LTC"];
-const cryptoPriceCache = {}; // symbol -> { symbol, name, price, change24h, marketCap, volume24h, lastUpdated, source }
+const cryptoPriceCache = {};
 let cryptoCacheFetchedAt = 0;
-const CRYPTO_CACHE_TTL_MS = 4500; // just under 5s so a 5-second Roblox poll gets fresh proxy data
+const CRYPTO_CACHE_TTL_MS = 4500;
 
 const CRYPTO_NAMES = {
   BTC: "Bitcoin",
@@ -531,23 +475,18 @@ function findBestObjectForSymbol(payload, symbol, allowGenericFallback = true) {
   const objects = collectObjectsDeep(payload);
   const wanted = normalizeSymbol(symbol);
 
-  // Prefer an object that explicitly says BTC/ETH/etc and has a price nearby.
   for (const obj of objects) {
     if (objectMentionsSymbol(obj, wanted) && findNumberDeep(obj, PRICE_KEYS) !== null) {
       return obj;
     }
   }
 
-  // Then keyed objects, e.g. { data: { BTC: { price: ... } } }.
   for (const obj of objects) {
     if (normalizeSymbol(obj._keyHint) === wanted && findNumberDeep(obj, PRICE_KEYS) !== null) {
       return obj;
     }
   }
 
-  // For single-symbol fallback calls, the API may return just { price: ... }
-  // without a symbol field. In that case, use the first object with a price.
-  // Do NOT do this for batch responses or one coin can accidentally fill every symbol.
   if (allowGenericFallback) {
     for (const obj of objects) {
       if (findNumberDeep(obj, PRICE_KEYS) !== null) {
@@ -601,7 +540,6 @@ async function fetchFreeCryptoAPI(symbols) {
   const prices = {};
   let lastError = null;
 
-  // First try the documented multi-symbol form: BTC+ETH+SOL.
   try {
     const joined = symbols.join("+");
     const batchUrl = `${FREECRYPTO_BASE_URL}/getData?symbol=${encodeURIComponent(joined)}`;
@@ -616,8 +554,6 @@ async function fetchFreeCryptoAPI(symbols) {
     lastError = e.message || "FreeCryptoAPI batch request failed.";
   }
 
-  // If the batch shape is weird, use single-symbol calls. This is slower but
-  // much easier to normalize because the symbol is known from the request.
   for (const symbol of symbols) {
     if (prices[symbol]) continue;
 
@@ -693,8 +629,6 @@ async function fetchCryptoPrices(symbols = CRYPTO_SYMBOLS) {
   let normalized = { ...freeCrypto.prices };
   let providerError = freeCrypto.error || null;
 
-  // Keep the game working if FreeCryptoAPI sends an unexpected shape, rate-limits,
-  // or rejects the key. FreeCryptoAPI is still attempted first every cache refresh.
   const missing = requestedSymbols.filter(symbol => !normalized[symbol]);
   if (missing.length > 0) {
     const fallback = await fetchCoinGeckoFallback(missing);
@@ -721,6 +655,128 @@ async function fetchCryptoPrices(symbols = CRYPTO_SYMBOLS) {
 }
 
 // ============================
+// Crypto candle cache - free Binance public klines
+// ============================
+const BINANCE_GLOBAL_BASE_URL = "https://api.binance.com";
+const BINANCE_US_BASE_URL = "https://api.binance.us";
+
+const CRYPTO_BINANCE_SYMBOLS = {
+  BTC: "BTCUSDT",
+  ETH: "ETHUSDT",
+  SOL: "SOLUSDT",
+  DOGE: "DOGEUSDT",
+  LTC: "LTCUSDT"
+};
+
+const CRYPTO_CANDLE_INTERVALS = {
+  "1m": "1m",
+  "5m": "5m",
+  "15m": "15m",
+  "1h": "1h",
+  "1d": "1d"
+};
+
+const cryptoCandleCache = {};
+
+const CRYPTO_CANDLE_TTL_MS = {
+  "1m": 5000,
+  "5m": 10000,
+  "15m": 20000,
+  "1h": 60000,
+  "1d": 5 * 60 * 1000
+};
+
+function getCryptoCandleTTL(interval) {
+  return CRYPTO_CANDLE_TTL_MS[interval] || 15000;
+}
+
+function getCachedCryptoCandles(symbol, interval) {
+  const key = `${symbol}:${interval}`;
+  const entry = cryptoCandleCache[key];
+  if (!entry) return null;
+  if (Date.now() - entry.fetchedAt > getCryptoCandleTTL(interval)) return null;
+  return entry;
+}
+
+function setCachedCryptoCandles(symbol, interval, data, source) {
+  const key = `${symbol}:${interval}`;
+  cryptoCandleCache[key] = { data, source, fetchedAt: Date.now() };
+}
+
+function formatUtcCandleTime(ms) {
+  const d = new Date(ms);
+  const pad = n => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
+function normalizeBinanceKlines(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter(k => Array.isArray(k) && k.length >= 6)
+    .map(k => ({
+      t: formatUtcCandleTime(Number(k[0])),
+      o: Number(k[1]),
+      h: Number(k[2]),
+      l: Number(k[3]),
+      c: Number(k[4]),
+      v: Number(k[5])
+    }))
+    .filter(c => Number.isFinite(c.o) && Number.isFinite(c.h) && Number.isFinite(c.l) && Number.isFinite(c.c));
+}
+
+async function fetchBinanceKlines(baseUrl, pair, interval, limit) {
+  const url = `${baseUrl}/api/v3/klines?symbol=${encodeURIComponent(pair)}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(limit)}`;
+  const resp = await fetchJsonWithTimeout(url, { headers: { Accept: "application/json" } }, 12000);
+  if (!resp.ok) {
+    const msg = resp.data?.msg || resp.data?.message || resp.data?.error || `HTTP ${resp.status}`;
+    throw new Error(msg);
+  }
+  const candles = normalizeBinanceKlines(resp.data);
+  if (candles.length === 0) throw new Error("No usable Binance kline data returned.");
+  return candles;
+}
+
+async function fetchCryptoCandles(symbol, interval) {
+  symbol = normalizeSymbol(symbol);
+  interval = String(interval || "1m").toLowerCase();
+
+  if (!CRYPTO_SYMBOLS.includes(symbol)) {
+    return { error: "Unsupported crypto symbol." };
+  }
+  if (!CRYPTO_CANDLE_INTERVALS[interval]) {
+    return { error: "Unsupported crypto interval. Use 1m, 5m, 15m, 1h, or 1d." };
+  }
+
+  const cached = getCachedCryptoCandles(symbol, interval);
+  if (cached) {
+    return { symbol, interval, candles: cached.data, cached: true, source: cached.source };
+  }
+
+  const pair = CRYPTO_BINANCE_SYMBOLS[symbol];
+  const binanceInterval = CRYPTO_CANDLE_INTERVALS[interval];
+  const limit = 200;
+  let lastError = null;
+
+  try {
+    const candles = await fetchBinanceKlines(BINANCE_GLOBAL_BASE_URL, pair, binanceInterval, limit);
+    setCachedCryptoCandles(symbol, interval, candles, "Binance global");
+    return { symbol, interval, pair, candles, cached: false, source: "Binance global" };
+  } catch (e) {
+    lastError = `Binance global: ${e.message}`;
+  }
+
+  try {
+    const candles = await fetchBinanceKlines(BINANCE_US_BASE_URL, pair, binanceInterval, limit);
+    setCachedCryptoCandles(symbol, interval, candles, "Binance.US");
+    return { symbol, interval, pair, candles, cached: false, source: "Binance.US" };
+  } catch (e) {
+    lastError = `${lastError}; Binance.US: ${e.message}`;
+  }
+
+  return { error: lastError || "Crypto candle request failed." };
+}
+
+// ============================
 // Routes
 // ============================
 app.get("/health", (req, res) => res.json({
@@ -736,138 +792,12 @@ app.get("/health", (req, res) => res.json({
   candleCacheEntries: Object.keys(candleCache).length,
   cryptoCached: Object.keys(cryptoPriceCache).length,
   cryptoSourceSample: cryptoPriceCache.BTC && cryptoPriceCache.BTC.source,
+  cryptoCandleCacheEntries: Object.keys(cryptoCandleCache).length,
   isRegularMarketHours: isRegularMarketHours(),
   isExtendedHours: isExtendedHours()
 }));
 
 app.get("/crypto/prices", async (req, res) => {
-  // ============================
-// Crypto candles - free Binance public klines
-// ============================
-const BINANCE_MARKET_DATA_URL = "https://data-api.binance.vision";
-
-const CRYPTO_BINANCE_SYMBOLS = {
-  BTC: "BTCUSDT",
-  ETH: "ETHUSDT",
-  SOL: "SOLUSDT",
-  DOGE: "DOGEUSDT",
-  LTC: "LTCUSDT"
-};
-
-const CRYPTO_CANDLE_INTERVALS = new Set([
-  "1m",
-  "5m",
-  "15m",
-  "30m",
-  "1h",
-  "1d"
-]);
-
-const cryptoCandleCache = {};
-const CRYPTO_CANDLE_TTL_MS = {
-  "1m": 10 * 1000,
-  "5m": 20 * 1000,
-  "15m": 45 * 1000,
-  "30m": 60 * 1000,
-  "1h": 2 * 60 * 1000,
-  "1d": 5 * 60 * 1000
-};
-
-function formatBinanceTime(ms) {
-  return new Date(ms).toISOString().replace("T", " ").slice(0, 19);
-}
-
-function getCryptoCandleCacheKey(symbol, interval) {
-  return `${symbol}:${interval}`;
-}
-
-function getCachedCryptoCandles(symbol, interval) {
-  const key = getCryptoCandleCacheKey(symbol, interval);
-  const cached = cryptoCandleCache[key];
-  if (!cached) return null;
-
-  const ttl = CRYPTO_CANDLE_TTL_MS[interval] || 30 * 1000;
-  if (Date.now() - cached.fetchedAt > ttl) return null;
-
-  return cached.data;
-}
-
-function setCachedCryptoCandles(symbol, interval, data) {
-  const key = getCryptoCandleCacheKey(symbol, interval);
-  cryptoCandleCache[key] = {
-    fetchedAt: Date.now(),
-    data
-  };
-}
-
-app.get("/crypto/candles", async (req, res) => {
-  const symbol = String(req.query.symbol || "").toUpperCase();
-  const interval = String(req.query.interval || "1m");
-
-  const binanceSymbol = CRYPTO_BINANCE_SYMBOLS[symbol];
-
-  if (!binanceSymbol) {
-    return res.json({ error: "Unsupported crypto symbol." });
-  }
-
-  if (!CRYPTO_CANDLE_INTERVALS.has(interval)) {
-    return res.json({ error: "Unsupported crypto candle interval." });
-  }
-
-  const cached = getCachedCryptoCandles(symbol, interval);
-  if (cached) {
-    return res.json({
-      symbol,
-      interval,
-      candles: cached,
-      cached: true
-    });
-  }
-
-  const limit = 200;
-  const url =
-    `${BINANCE_MARKET_DATA_URL}/api/v3/klines` +
-    `?symbol=${encodeURIComponent(binanceSymbol)}` +
-    `&interval=${encodeURIComponent(interval)}` +
-    `&limit=${limit}`;
-
-  try {
-    const response = await fetch(url);
-    const data = await response.json();
-
-    if (!Array.isArray(data)) {
-      return res.json({
-        error: data && data.msg ? data.msg : "No crypto candle data returned."
-      });
-    }
-
-    const candles = data.map(k => ({
-      t: formatBinanceTime(k[0]),
-      o: parseFloat(k[1]),
-      h: parseFloat(k[2]),
-      l: parseFloat(k[3]),
-      c: parseFloat(k[4]),
-      v: parseFloat(k[5])
-    })).filter(c =>
-      Number.isFinite(c.o) &&
-      Number.isFinite(c.h) &&
-      Number.isFinite(c.l) &&
-      Number.isFinite(c.c)
-    );
-
-    setCachedCryptoCandles(symbol, interval, candles);
-
-    res.json({
-      symbol,
-      interval,
-      candles
-    });
-  } catch (err) {
-    res.json({
-      error: err.message || "Failed to fetch crypto candles."
-    });
-  }
-});
   const rawSymbols = String(req.query.symbols || "BTC,ETH,SOL,DOGE,LTC")
     .toUpperCase()
     .replace(/\s+/g, "")
@@ -879,6 +809,13 @@ app.get("/crypto/candles", async (req, res) => {
     .filter(s => CRYPTO_SYMBOLS.includes(s));
 
   const result = await fetchCryptoPrices(symbols.length > 0 ? symbols : CRYPTO_SYMBOLS);
+  res.json(result);
+});
+
+app.get("/crypto/candles", async (req, res) => {
+  const symbol = normalizeSymbol(req.query.symbol || req.query.ticker || "BTC");
+  const interval = String(req.query.interval || "1m").toLowerCase();
+  const result = await fetchCryptoCandles(symbol, interval);
   res.json(result);
 });
 
@@ -907,16 +844,17 @@ app.get("/crypto/debug", async (req, res) => {
 });
 
 app.get("/prices", (req, res) => res.json(priceCache));
+
 app.get("/price", (req, res) => {
   const ticker = (req.query.ticker || "").toUpperCase();
   const data = priceCache[ticker];
   res.json(data ? { ticker, ...data } : { error: "No data" });
 });
+
 app.get("/candles", async (req, res) => {
   const ticker = (req.query.ticker || "").toUpperCase();
   const interval = req.query.interval || "1min";
 
-  // Map frontend intervals to Twelve Data intervals
   const intervalMap = {
     "1m": "1min",
     "5m": "5min",
@@ -927,34 +865,21 @@ app.get("/candles", async (req, res) => {
   };
   const tdInterval = intervalMap[interval] || interval;
 
-  // Serve from cache if it's still fresh. This is the part that makes N
-  // players watching the same ticker/timeframe cost 1 credit instead of N.
   const cached = getCachedCandles(ticker, tdInterval);
   if (cached) {
     return res.json({ ticker, interval: tdInterval, candles: cached, cached: true });
   }
 
-  // Fetch the full 200-candle window in one shot per ticker+interval.
-  // Twelve Data bills 1 credit per /time_series call regardless of
-  // outputsize, so this costs exactly the same as the old 60 - the extra
-  // candles are "free" and let the client scroll/pan through history
-  // entirely from data it already has in memory, with zero additional
-  // server requests.
   const outputsize = 200;
   const url = `https://api.twelvedata.com/time_series?symbol=${ticker}&interval=${tdInterval}&outputsize=${outputsize}&apikey=${TWELVE_DATA_API_KEY}`;
 
   try {
-    // Routed through the shared rate-limited queue (TD_PRIORITY.candle) so
-    // this can never combine with background polling to exceed 8/min.
     const data = await tdRequest(url, TD_PRIORITY.candle);
 
     if (data.status === "error" || !data.values) {
-      // Don't cache errors - let the next request try again rather than
-      // pinning a failure in place for the full TTL window.
       return res.json({ error: data.message || "No data" });
     }
 
-    // Normalize to simple OHLC array, oldest first
     const candles = data.values.reverse().map(v => ({
       t: v.datetime,
       o: parseFloat(v.open),
@@ -969,12 +894,6 @@ app.get("/candles", async (req, res) => {
 
     res.json({ ticker, interval: tdInterval, candles });
   } catch (e) {
-    // Always respond 200 with an {error} field rather than a non-2xx
-    // status. Roblox's HttpService:GetAsync throws on non-2xx, which the
-    // server's pcall catches and turns into a generic "Network error"
-    // message - that would swallow useful messages like the queue-timeout
-    // / queue-full ones below. Keeping this 200 lets the real message
-    // reach the client's "Chart unavailable: ..." label.
     res.json({ error: e.message });
   }
 });
@@ -984,17 +903,19 @@ app.get("/candles", async (req, res) => {
 // ============================
 async function start() {
   await seedPrevClose();
-  // If currently in extended hours, do an immediate Twelve Data poll
+
   if (isExtendedHours()) {
     console.log("[INIT] Extended hours detected, running initial Twelve Data poll...");
     for (let i = 0; i < Math.ceil(TICKERS.length / BATCH_SIZE); i++) {
       await pollTwelveDataBatch();
-      await new Promise(r => setTimeout(r, 500)); // Small delay between batches
+      await new Promise(r => setTimeout(r, 500));
     }
   }
+
   connectFinnhub();
   startFinnhubRestPolling();
   startTwelveDataPolling();
   app.listen(PORT, () => console.log(`[SERVER] Ready on ${PORT}`));
 }
+
 start();
