@@ -4,6 +4,8 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY;
+const FREECRYPTO_API_KEY = process.env.FREECRYPTO_API_KEY;
+const FREECRYPTO_BASE_URL = "https://api.freecryptoapi.com/v1";
 
 const priceCache = {};
 const TICKERS = [
@@ -381,6 +383,129 @@ function setCachedCandles(ticker, interval, data) {
   candleCache[key] = { data, fetchedAt: Date.now() };
 }
 
+
+// ============================
+// Crypto price cache (FreeCryptoAPI)
+// ============================
+const CRYPTO_SYMBOLS = ["BTC", "ETH", "SOL", "DOGE", "LTC"];
+const cryptoPriceCache = {}; // symbol -> { symbol, name, price, change24h, marketCap, volume24h, lastUpdated }
+let cryptoCacheFetchedAt = 0;
+const CRYPTO_CACHE_TTL_MS = 10 * 1000;
+
+const CRYPTO_NAMES = {
+  BTC: "Bitcoin",
+  ETH: "Ethereum",
+  SOL: "Solana",
+  DOGE: "Dogecoin",
+  LTC: "Litecoin"
+};
+
+function toNumber(value) {
+  if (value === null || value === undefined) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function pickNumber(obj, keys) {
+  for (const key of keys) {
+    if (obj && Object.prototype.hasOwnProperty.call(obj, key)) {
+      const n = toNumber(obj[key]);
+      if (n !== null) return n;
+    }
+  }
+  return null;
+}
+
+function flattenCryptoPayload(payload) {
+  if (!payload) return [];
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload.data)) return payload.data;
+  if (Array.isArray(payload.result)) return payload.result;
+  if (payload.data && typeof payload.data === "object") {
+    if (payload.data.symbol || payload.data.price) return [payload.data];
+    return Object.values(payload.data);
+  }
+  if (payload.result && typeof payload.result === "object") {
+    if (payload.result.symbol || payload.result.price) return [payload.result];
+    return Object.values(payload.result);
+  }
+  if (payload.symbol || payload.price) return [payload];
+  return Object.values(payload).filter(v => v && typeof v === "object");
+}
+
+function normalizeCryptoPrices(payload) {
+  const rows = flattenCryptoPayload(payload);
+  const normalized = {};
+
+  for (const raw of rows) {
+    if (!raw || typeof raw !== "object") continue;
+
+    const symbol = String(raw.symbol || raw.ticker || raw.code || raw.name || "").toUpperCase();
+    if (!symbol || !CRYPTO_SYMBOLS.includes(symbol)) continue;
+
+    const quoteUsd = raw.quote && (raw.quote.USD || raw.quote.usd);
+    const source = quoteUsd || raw;
+
+    const price = pickNumber(source, ["price", "current_price", "last_price", "last", "close", "usd"]);
+    if (price === null || price <= 0) continue;
+
+    normalized[symbol] = {
+      symbol,
+      name: raw.name || CRYPTO_NAMES[symbol] || symbol,
+      price,
+      change24h: pickNumber(source, ["change_24h", "change24h", "percent_change_24h", "price_change_percentage_24h", "changePct", "change_pct"]),
+      marketCap: pickNumber(source, ["market_cap", "marketCap", "market_cap_usd"]),
+      volume24h: pickNumber(source, ["volume", "volume_24h", "volume24h", "total_volume"]),
+      lastUpdated: Math.floor(Date.now() / 1000)
+    };
+  }
+
+  return normalized;
+}
+
+async function fetchCryptoPrices(symbols = CRYPTO_SYMBOLS) {
+  if (!FREECRYPTO_API_KEY) {
+    return { error: "FREECRYPTO_API_KEY is not set on the proxy server." };
+  }
+
+  const now = Date.now();
+  if (Object.keys(cryptoPriceCache).length > 0 && now - cryptoCacheFetchedAt < CRYPTO_CACHE_TTL_MS) {
+    return { prices: cryptoPriceCache, cached: true };
+  }
+
+  const symbolParam = symbols.join("+");
+  const url = `${FREECRYPTO_BASE_URL}/getData?symbol=${encodeURIComponent(symbolParam)}`;
+
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${FREECRYPTO_API_KEY}`,
+        Accept: "application/json"
+      }
+    });
+
+    const data = await resp.json().catch(() => ({}));
+
+    if (!resp.ok) {
+      return { error: data.message || data.error || `FreeCryptoAPI HTTP ${resp.status}` };
+    }
+
+    const normalized = normalizeCryptoPrices(data);
+    if (Object.keys(normalized).length === 0) {
+      return { error: "FreeCryptoAPI returned no usable crypto prices.", raw: data };
+    }
+
+    for (const [symbol, info] of Object.entries(normalized)) {
+      cryptoPriceCache[symbol] = info;
+    }
+    cryptoCacheFetchedAt = now;
+
+    return { prices: cryptoPriceCache, cached: false };
+  } catch (e) {
+    return { error: e.message || "Crypto price request failed." };
+  }
+}
+
 // ============================
 // Routes
 // ============================
@@ -395,9 +520,25 @@ app.get("/health", (req, res) => res.json({
   twelveDataQueueDepth: tdQueueDepth(),
   twelveDataCallsInLastMinute: tdCallsInLastMinute(),
   candleCacheEntries: Object.keys(candleCache).length,
+  cryptoCached: Object.keys(cryptoPriceCache).length,
   isRegularMarketHours: isRegularMarketHours(),
   isExtendedHours: isExtendedHours()
 }));
+
+app.get("/crypto/prices", async (req, res) => {
+  const rawSymbols = String(req.query.symbols || "BTC,ETH,SOL,DOGE,LTC")
+    .toUpperCase()
+    .replace(/\s+/g, "")
+    .replace(/\+/g, ",");
+
+  const symbols = rawSymbols
+    .split(",")
+    .filter(Boolean)
+    .filter(s => CRYPTO_SYMBOLS.includes(s));
+
+  const result = await fetchCryptoPrices(symbols.length > 0 ? symbols : CRYPTO_SYMBOLS);
+  res.json(result);
+});
 app.get("/prices", (req, res) => res.json(priceCache));
 app.get("/price", (req, res) => {
   const ticker = (req.query.ticker || "").toUpperCase();
