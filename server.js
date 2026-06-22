@@ -178,13 +178,20 @@ let twelveDataBatchIndex = 0;
 let twelveDataCreditsUsedToday = 0;
 let lastCreditReset = new Date().toDateString();
 
-const MAX_CREDITS_PER_DAY = 750;
+const MAX_CREDITS_PER_DAY = Number(process.env.TWELVE_DATA_MAX_CREDITS_PER_DAY || 50);
+
+// Background Twelve Data quote polling is OFF by default; it was burning daily credits without players opening charts.
+// Real Twelve Data candles stay ON by default, but are cached longer and fall back to synthetic candles if the API limit is hit.
+// Set ENABLE_TWELVE_DATA_CANDLES=false if you want stock charts to use zero Twelve Data candle credits.
+const ENABLE_TWELVE_DATA_POLLING = process.env.ENABLE_TWELVE_DATA_POLLING === "true";
+const ENABLE_TWELVE_DATA_CANDLES = process.env.ENABLE_TWELVE_DATA_CANDLES !== "false";
 
 function resetCreditsIfNewDay() {
   const today = new Date().toDateString();
 
   if (today !== lastCreditReset) {
     twelveDataCreditsUsedToday = 0;
+    twelveDataCandleCreditsUsedToday = 0;
     lastCreditReset = today;
     console.log("[12DATA] Credits reset for new day");
   }
@@ -382,17 +389,18 @@ function startTwelveDataPolling() {
 const candleCache = {};
 
 const CANDLE_TTL_MS = {
-  "1min": 20 * 1000,
-  "5min": 60 * 1000,
-  "15min": 3 * 60 * 1000,
-  "30min": 5 * 60 * 1000,
-  "1h": 10 * 60 * 1000,
-  "1day": 60 * 60 * 1000
+  "1min": 10 * 60 * 1000,
+  "5min": 15 * 60 * 1000,
+  "15min": 30 * 60 * 1000,
+  "30min": 60 * 60 * 1000,
+  "1h": 2 * 60 * 60 * 1000,
+  "1day": 6 * 60 * 60 * 1000
 };
 
-const DEFAULT_CANDLE_TTL_MS = 60 * 1000;
+const DEFAULT_CANDLE_TTL_MS = 15 * 60 * 1000;
 
 let twelveDataCandleCreditsUsedToday = 0;
+const MAX_TWELVE_DATA_CANDLE_CREDITS_PER_DAY = Number(process.env.TWELVE_DATA_MAX_CANDLE_CREDITS_PER_DAY || 100);
 
 function getCandleTTL(interval) {
   return CANDLE_TTL_MS[interval] || DEFAULT_CANDLE_TTL_MS;
@@ -417,6 +425,138 @@ function setCachedCandles(ticker, interval, data) {
   candleCache[key] = {
     data,
     fetchedAt: Date.now()
+  };
+}
+
+
+const STOCK_CANDLE_INTERVAL_SECONDS = {
+  "1min": 60,
+  "5min": 5 * 60,
+  "15min": 15 * 60,
+  "30min": 30 * 60,
+  "1h": 60 * 60,
+  "1day": 24 * 60 * 60
+};
+
+function stableHashString(value) {
+  let hash = 2166136261;
+  const str = String(value || "");
+
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return hash >>> 0;
+}
+
+function deterministicUnit(seed) {
+  const x = Math.sin(seed) * 10000;
+  return x - Math.floor(x);
+}
+
+function roundCandleNumber(n) {
+  if (!Number.isFinite(n)) return 0;
+  if (Math.abs(n) >= 100) return Number(n.toFixed(2));
+  if (Math.abs(n) >= 1) return Number(n.toFixed(4));
+  return Number(n.toFixed(6));
+}
+
+function formatSyntheticStockCandleTime(ms, interval) {
+  const d = new Date(ms);
+  const pad = n => String(n).padStart(2, "0");
+
+  const date =
+    `${d.getUTCFullYear()}-` +
+    `${pad(d.getUTCMonth() + 1)}-` +
+    `${pad(d.getUTCDate())}`;
+
+  if (interval === "1day") return date;
+
+  return (
+    `${date} ` +
+    `${pad(d.getUTCHours())}:` +
+    `${pad(d.getUTCMinutes())}:` +
+    `${pad(d.getUTCSeconds())}`
+  );
+}
+
+function generateSyntheticStockCandles(ticker, interval, limit = 200) {
+  ticker = String(ticker || "").toUpperCase();
+  interval = String(interval || "1min");
+
+  const seconds = STOCK_CANDLE_INTERVAL_SECONDS[interval];
+
+  if (!seconds) {
+    return {
+      error: "Unsupported stock candle interval."
+    };
+  }
+
+  const info = priceCache[ticker];
+  const currentPrice = info && toNumber(info.price || info.prevClose);
+
+  if (!currentPrice || currentPrice <= 0) {
+    return {
+      error: "No cached stock price available yet. Wait for prices to load, then try the chart again."
+    };
+  }
+
+  const prevCloseRaw = info && toNumber(info.prevClose);
+  const anchorPrice = prevCloseRaw && prevCloseRaw > 0 ? prevCloseRaw : currentPrice;
+  const stepMs = seconds * 1000;
+  const endMs = Math.floor(Date.now() / stepMs) * stepMs;
+  const hash = stableHashString(`${ticker}:${interval}`);
+  const candles = [];
+
+  let previousClose = anchorPrice;
+  const totalMove = currentPrice - anchorPrice;
+  const movePct = Math.abs(totalMove) / Math.max(anchorPrice, 0.000001);
+  const wigglePct = Math.max(0.0015, Math.min(0.018, 0.004 + movePct * 0.35));
+
+  for (let i = 0; i < limit; i++) {
+    const progress = limit <= 1 ? 1 : i / (limit - 1);
+    const tMs = endMs - ((limit - i - 1) * stepMs);
+
+    const drift = anchorPrice + (totalMove * progress);
+    const wave = Math.sin((i + (hash % 97)) * 0.31) * anchorPrice * wigglePct;
+    const noise = (deterministicUnit(hash + i * 7919) - 0.5) * anchorPrice * wigglePct * 0.65;
+
+    let close = drift + wave + noise;
+    if (i === limit - 1) close = currentPrice;
+    if (!Number.isFinite(close) || close <= 0) close = Math.max(currentPrice * 0.01, 0.000001);
+
+    let open = i === 0
+      ? close * (1 + ((deterministicUnit(hash + 17) - 0.5) * wigglePct))
+      : previousClose;
+
+    if (!Number.isFinite(open) || open <= 0) open = close;
+
+    const body = Math.abs(close - open);
+    const minSpread = Math.max(currentPrice * 0.0008, 0.000001);
+    const spread = Math.max(body, minSpread);
+    const highExtra = spread * (0.35 + deterministicUnit(hash + i * 3571));
+    const lowExtra = spread * (0.35 + deterministicUnit(hash + i * 5501));
+
+    const high = Math.max(open, close) + highExtra;
+    const low = Math.max(0.000001, Math.min(open, close) - lowExtra);
+    const volume = Math.round(100000 + deterministicUnit(hash + i * 1013) * 900000);
+
+    candles.push({
+      t: formatSyntheticStockCandleTime(tMs, interval),
+      o: roundCandleNumber(open),
+      h: roundCandleNumber(high),
+      l: roundCandleNumber(low),
+      c: roundCandleNumber(close),
+      v: volume
+    });
+
+    previousClose = close;
+  }
+
+  return {
+    candles,
+    source: "proxy synthetic stock candles"
   };
 }
 
@@ -950,7 +1090,6 @@ const CRYPTO_CANDLE_INTERVALS = {
   "1m": "1m",
   "5m": "5m",
   "15m": "15m",
-  "30m": "30m",
   "1h": "1h",
   "1d": "1d"
 };
@@ -961,7 +1100,6 @@ const CRYPTO_CANDLE_TTL_MS = {
   "1m": 5000,
   "5m": 10000,
   "15m": 20000,
-  "30m": 30000,
   "1h": 60000,
   "1d": 5 * 60 * 1000
 };
@@ -1161,6 +1299,9 @@ app.get("/health", (req, res) => {
     cached: Object.keys(priceCache).length,
     twelveDataCreditsUsedToday,
     twelveDataCandleCreditsUsedToday,
+    maxTwelveDataCandleCreditsPerDay: MAX_TWELVE_DATA_CANDLE_CREDITS_PER_DAY,
+    twelveDataPollingEnabled: ENABLE_TWELVE_DATA_POLLING,
+    twelveDataCandlesEnabled: ENABLE_TWELVE_DATA_CANDLES,
     twelveDataQueueDepth: tdQueueDepth(),
     twelveDataCallsInLastMinute: tdCallsInLastMinute(),
     candleCacheEntries: Object.keys(candleCache).length,
@@ -1280,6 +1421,13 @@ app.get("/candles", async (req, res) => {
   };
 
   const tdInterval = intervalMap[interval] || interval;
+  const outputsize = 200;
+
+  if (!ticker) {
+    return res.json({
+      error: "Missing ticker."
+    });
+  }
 
   const cached = getCachedCandles(ticker, tdInterval);
 
@@ -1292,7 +1440,68 @@ app.get("/candles", async (req, res) => {
     });
   }
 
-  const outputsize = 200;
+  // Optional no-credit path. Leave ENABLE_TWELVE_DATA_CANDLES unset to use
+  // real Twelve Data candles with long caching; set it to false for synthetic
+  // stock candles that never spend Twelve Data chart credits.
+  if (!ENABLE_TWELVE_DATA_CANDLES) {
+    const generated = generateSyntheticStockCandles(ticker, tdInterval, outputsize);
+
+    if (generated.error) {
+      return res.json({
+        error: generated.error
+      });
+    }
+
+    return res.json({
+      ticker,
+      interval: tdInterval,
+      candles: generated.candles,
+      cached: false,
+      synthetic: true,
+      source: generated.source,
+      note: "Twelve Data stock candles are disabled, so this chart used zero Twelve Data credits."
+    });
+  }
+
+  if (!TWELVE_DATA_API_KEY) {
+    const generated = generateSyntheticStockCandles(ticker, tdInterval, outputsize);
+
+    if (generated.error) {
+      return res.json({
+        error: "TWELVE_DATA_API_KEY is not set and synthetic fallback could not be generated: " + generated.error
+      });
+    }
+
+    return res.json({
+      ticker,
+      interval: tdInterval,
+      candles: generated.candles,
+      cached: false,
+      synthetic: true,
+      source: generated.source,
+      providerError: "TWELVE_DATA_API_KEY is not set."
+    });
+  }
+
+  if (twelveDataCandleCreditsUsedToday >= MAX_TWELVE_DATA_CANDLE_CREDITS_PER_DAY) {
+    const generated = generateSyntheticStockCandles(ticker, tdInterval, outputsize);
+
+    if (!generated.error) {
+      return res.json({
+        ticker,
+        interval: tdInterval,
+        candles: generated.candles,
+        cached: false,
+        synthetic: true,
+        source: generated.source,
+        providerError: "Proxy Twelve Data candle cap reached for today."
+      });
+    }
+
+    return res.json({
+      error: "Proxy Twelve Data candle cap reached for today."
+    });
+  }
 
   const url =
     `https://api.twelvedata.com/time_series` +
@@ -1305,6 +1514,20 @@ app.get("/candles", async (req, res) => {
     const data = await tdRequest(url, TD_PRIORITY.candle);
 
     if (data.status === "error" || !data.values) {
+      const generated = generateSyntheticStockCandles(ticker, tdInterval, outputsize);
+
+      if (!generated.error) {
+        return res.json({
+          ticker,
+          interval: tdInterval,
+          candles: generated.candles,
+          cached: false,
+          synthetic: true,
+          source: generated.source,
+          providerError: data.message || "No Twelve Data candle data"
+        });
+      }
+
       return res.json({
         error: data.message || "No data"
       });
@@ -1325,9 +1548,26 @@ app.get("/candles", async (req, res) => {
     res.json({
       ticker,
       interval: tdInterval,
-      candles
+      candles,
+      cached: false,
+      synthetic: false,
+      source: "Twelve Data"
     });
   } catch (e) {
+    const generated = generateSyntheticStockCandles(ticker, tdInterval, outputsize);
+
+    if (!generated.error) {
+      return res.json({
+        ticker,
+        interval: tdInterval,
+        candles: generated.candles,
+        cached: false,
+        synthetic: true,
+        source: generated.source,
+        providerError: e.message
+      });
+    }
+
     res.json({
       error: e.message
     });
@@ -1340,7 +1580,7 @@ app.get("/candles", async (req, res) => {
 async function start() {
   await seedPrevClose();
 
-  if (isExtendedHours()) {
+  if (ENABLE_TWELVE_DATA_POLLING && isExtendedHours()) {
     console.log("[INIT] Extended hours detected, running initial Twelve Data poll...");
 
     for (let i = 0; i < Math.ceil(TICKERS.length / BATCH_SIZE); i++) {
@@ -1351,7 +1591,12 @@ async function start() {
 
   connectFinnhub();
   startFinnhubRestPolling();
-  startTwelveDataPolling();
+
+  if (ENABLE_TWELVE_DATA_POLLING) {
+    startTwelveDataPolling();
+  } else {
+    console.log("[12DATA] Quote polling disabled. Set ENABLE_TWELVE_DATA_POLLING=true to re-enable it.");
+  }
 
   app.listen(PORT, () => {
     console.log(`[SERVER] Ready on ${PORT}`);
