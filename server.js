@@ -741,6 +741,133 @@ app.get("/health", (req, res) => res.json({
 }));
 
 app.get("/crypto/prices", async (req, res) => {
+  // ============================
+// Crypto candles - free Binance public klines
+// ============================
+const BINANCE_MARKET_DATA_URL = "https://data-api.binance.vision";
+
+const CRYPTO_BINANCE_SYMBOLS = {
+  BTC: "BTCUSDT",
+  ETH: "ETHUSDT",
+  SOL: "SOLUSDT",
+  DOGE: "DOGEUSDT",
+  LTC: "LTCUSDT"
+};
+
+const CRYPTO_CANDLE_INTERVALS = new Set([
+  "1m",
+  "5m",
+  "15m",
+  "30m",
+  "1h",
+  "1d"
+]);
+
+const cryptoCandleCache = {};
+const CRYPTO_CANDLE_TTL_MS = {
+  "1m": 10 * 1000,
+  "5m": 20 * 1000,
+  "15m": 45 * 1000,
+  "30m": 60 * 1000,
+  "1h": 2 * 60 * 1000,
+  "1d": 5 * 60 * 1000
+};
+
+function formatBinanceTime(ms) {
+  return new Date(ms).toISOString().replace("T", " ").slice(0, 19);
+}
+
+function getCryptoCandleCacheKey(symbol, interval) {
+  return `${symbol}:${interval}`;
+}
+
+function getCachedCryptoCandles(symbol, interval) {
+  const key = getCryptoCandleCacheKey(symbol, interval);
+  const cached = cryptoCandleCache[key];
+  if (!cached) return null;
+
+  const ttl = CRYPTO_CANDLE_TTL_MS[interval] || 30 * 1000;
+  if (Date.now() - cached.fetchedAt > ttl) return null;
+
+  return cached.data;
+}
+
+function setCachedCryptoCandles(symbol, interval, data) {
+  const key = getCryptoCandleCacheKey(symbol, interval);
+  cryptoCandleCache[key] = {
+    fetchedAt: Date.now(),
+    data
+  };
+}
+
+app.get("/crypto/candles", async (req, res) => {
+  const symbol = String(req.query.symbol || "").toUpperCase();
+  const interval = String(req.query.interval || "1m");
+
+  const binanceSymbol = CRYPTO_BINANCE_SYMBOLS[symbol];
+
+  if (!binanceSymbol) {
+    return res.json({ error: "Unsupported crypto symbol." });
+  }
+
+  if (!CRYPTO_CANDLE_INTERVALS.has(interval)) {
+    return res.json({ error: "Unsupported crypto candle interval." });
+  }
+
+  const cached = getCachedCryptoCandles(symbol, interval);
+  if (cached) {
+    return res.json({
+      symbol,
+      interval,
+      candles: cached,
+      cached: true
+    });
+  }
+
+  const limit = 200;
+  const url =
+    `${BINANCE_MARKET_DATA_URL}/api/v3/klines` +
+    `?symbol=${encodeURIComponent(binanceSymbol)}` +
+    `&interval=${encodeURIComponent(interval)}` +
+    `&limit=${limit}`;
+
+  try {
+    const response = await fetch(url);
+    const data = await response.json();
+
+    if (!Array.isArray(data)) {
+      return res.json({
+        error: data && data.msg ? data.msg : "No crypto candle data returned."
+      });
+    }
+
+    const candles = data.map(k => ({
+      t: formatBinanceTime(k[0]),
+      o: parseFloat(k[1]),
+      h: parseFloat(k[2]),
+      l: parseFloat(k[3]),
+      c: parseFloat(k[4]),
+      v: parseFloat(k[5])
+    })).filter(c =>
+      Number.isFinite(c.o) &&
+      Number.isFinite(c.h) &&
+      Number.isFinite(c.l) &&
+      Number.isFinite(c.c)
+    );
+
+    setCachedCryptoCandles(symbol, interval, candles);
+
+    res.json({
+      symbol,
+      interval,
+      candles
+    });
+  } catch (err) {
+    res.json({
+      error: err.message || "Failed to fetch crypto candles."
+    });
+  }
+});
   const rawSymbols = String(req.query.symbols || "BTC,ETH,SOL,DOGE,LTC")
     .toUpperCase()
     .replace(/\s+/g, "")
