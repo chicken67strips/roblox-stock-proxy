@@ -416,31 +416,66 @@ function pickNumber(obj, keys) {
   return null;
 }
 
-function flattenCryptoPayload(payload) {
-  if (!payload) return [];
-  if (Array.isArray(payload)) return payload;
-  if (Array.isArray(payload.data)) return payload.data;
-  if (Array.isArray(payload.result)) return payload.result;
-  if (payload.data && typeof payload.data === "object") {
-    if (payload.data.symbol || payload.data.price) return [payload.data];
-    return Object.values(payload.data);
-  }
-  if (payload.result && typeof payload.result === "object") {
-    if (payload.result.symbol || payload.result.price) return [payload.result];
-    return Object.values(payload.result);
-  }
-  if (payload.symbol || payload.price) return [payload];
-  return Object.values(payload).filter(v => v && typeof v === "object");
+function normalizeSymbol(symbol) {
+  return String(symbol || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
-function normalizeCryptoPrices(payload) {
-  const rows = flattenCryptoPayload(payload);
+function attachFallbackSymbol(row, fallbackSymbol) {
+  if (!row || typeof row !== "object") return null;
+  return { ...row, _fallbackSymbol: normalizeSymbol(fallbackSymbol) };
+}
+
+function flattenCryptoPayload(payload, fallbackSymbol = null) {
+  if (!payload) return [];
+
+  if (Array.isArray(payload)) {
+    return payload.map(row => attachFallbackSymbol(row, fallbackSymbol)).filter(Boolean);
+  }
+
+  if (Array.isArray(payload.data)) {
+    return payload.data.map(row => attachFallbackSymbol(row, fallbackSymbol)).filter(Boolean);
+  }
+
+  if (Array.isArray(payload.result)) {
+    return payload.result.map(row => attachFallbackSymbol(row, fallbackSymbol)).filter(Boolean);
+  }
+
+  if (payload.data && typeof payload.data === "object") {
+    if (payload.data.symbol || payload.data.price) {
+      return [attachFallbackSymbol(payload.data, fallbackSymbol)].filter(Boolean);
+    }
+    return Object.entries(payload.data)
+      .map(([key, value]) => attachFallbackSymbol(value, key))
+      .filter(Boolean);
+  }
+
+  if (payload.result && typeof payload.result === "object") {
+    if (payload.result.symbol || payload.result.price) {
+      return [attachFallbackSymbol(payload.result, fallbackSymbol)].filter(Boolean);
+    }
+    return Object.entries(payload.result)
+      .map(([key, value]) => attachFallbackSymbol(value, key))
+      .filter(Boolean);
+  }
+
+  if (payload.symbol || payload.price) {
+    return [attachFallbackSymbol(payload, fallbackSymbol)].filter(Boolean);
+  }
+
+  return Object.entries(payload)
+    .filter(([, value]) => value && typeof value === "object")
+    .map(([key, value]) => attachFallbackSymbol(value, key))
+    .filter(Boolean);
+}
+
+function normalizeCryptoPrices(payload, fallbackSymbol = null) {
+  const rows = flattenCryptoPayload(payload, fallbackSymbol);
   const normalized = {};
 
   for (const raw of rows) {
     if (!raw || typeof raw !== "object") continue;
 
-    const symbol = String(raw.symbol || raw.ticker || raw.code || raw.name || "").toUpperCase();
+    const symbol = normalizeSymbol(raw.symbol || raw.ticker || raw.code || raw._fallbackSymbol);
     if (!symbol || !CRYPTO_SYMBOLS.includes(symbol)) continue;
 
     const quoteUsd = raw.quote && (raw.quote.USD || raw.quote.usd);
@@ -463,36 +498,67 @@ function normalizeCryptoPrices(payload) {
   return normalized;
 }
 
+async function cryptoFetchJson(url) {
+  const resp = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${FREECRYPTO_API_KEY}`,
+      Accept: "application/json"
+    }
+  });
+
+  const data = await resp.json().catch(() => ({}));
+  return { ok: resp.ok, status: resp.status, data };
+}
+
 async function fetchCryptoPrices(symbols = CRYPTO_SYMBOLS) {
   if (!FREECRYPTO_API_KEY) {
     return { error: "FREECRYPTO_API_KEY is not set on the proxy server." };
   }
 
+  const requestedSymbols = symbols
+    .map(normalizeSymbol)
+    .filter(symbol => CRYPTO_SYMBOLS.includes(symbol));
+
   const now = Date.now();
-  if (Object.keys(cryptoPriceCache).length > 0 && now - cryptoCacheFetchedAt < CRYPTO_CACHE_TTL_MS) {
+  const cacheHasAllRequested = requestedSymbols.every(symbol => cryptoPriceCache[symbol]);
+  if (cacheHasAllRequested && now - cryptoCacheFetchedAt < CRYPTO_CACHE_TTL_MS) {
     return { prices: cryptoPriceCache, cached: true };
   }
 
-  const symbolParam = symbols.join("+");
-  const url = `${FREECRYPTO_BASE_URL}/getData?symbol=${encodeURIComponent(symbolParam)}`;
+  const normalized = {};
+  let lastError = null;
 
   try {
-    const resp = await fetch(url, {
-      headers: {
-        Authorization: `Bearer ${FREECRYPTO_API_KEY}`,
-        Accept: "application/json"
-      }
-    });
+    // Try the documented multi-symbol form first. Some responses are keyed by
+    // symbol, so normalizeCryptoPrices preserves object keys as fallback symbols.
+    const symbolParam = requestedSymbols.join("+");
+    const batchUrl = `${FREECRYPTO_BASE_URL}/getData?symbol=${encodeURIComponent(symbolParam)}`;
+    const batch = await cryptoFetchJson(batchUrl);
 
-    const data = await resp.json().catch(() => ({}));
-
-    if (!resp.ok) {
-      return { error: data.message || data.error || `FreeCryptoAPI HTTP ${resp.status}` };
+    if (batch.ok) {
+      Object.assign(normalized, normalizeCryptoPrices(batch.data));
+    } else {
+      lastError = batch.data.message || batch.data.error || `FreeCryptoAPI HTTP ${batch.status}`;
     }
 
-    const normalized = normalizeCryptoPrices(data);
+    // Fallback: if the batch response did not contain every coin, request only
+    // the missing symbols one-by-one. This fixes providers that accept BTC but
+    // do not return BTC+ETH+SOL+DOGE+LTC in the shape we expected.
+    const missingSymbols = requestedSymbols.filter(symbol => !normalized[symbol]);
+    for (const symbol of missingSymbols) {
+      const singleUrl = `${FREECRYPTO_BASE_URL}/getData?symbol=${encodeURIComponent(symbol)}`;
+      const single = await cryptoFetchJson(singleUrl);
+
+      if (!single.ok) {
+        lastError = single.data.message || single.data.error || `FreeCryptoAPI HTTP ${single.status}`;
+        continue;
+      }
+
+      Object.assign(normalized, normalizeCryptoPrices(single.data, symbol));
+    }
+
     if (Object.keys(normalized).length === 0) {
-      return { error: "FreeCryptoAPI returned no usable crypto prices.", raw: data };
+      return { error: lastError || "FreeCryptoAPI returned no usable crypto prices." };
     }
 
     for (const [symbol, info] of Object.entries(normalized)) {
