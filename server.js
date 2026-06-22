@@ -24,41 +24,231 @@ let lastWsTradeTime = 0;
 const WS_QUIET_THRESHOLD_MS = 60000;
 
 // ============================
-// Market hours check UTC
+// US stock market session status (Eastern Time)
 // ============================
-function getUTCComponents() {
-  const now = new Date();
+function getEasternDateParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(date);
+
+  const out = {};
+
+  for (const part of parts) {
+    if (part.type !== "literal") out[part.type] = part.value;
+  }
+
+  const weekdayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
   return {
-    wday: now.getUTCDay(),
-    hour: now.getUTCHours(),
-    min: now.getUTCMinutes()
+    year: Number(out.year),
+    month: Number(out.month),
+    day: Number(out.day),
+    hour: Number(out.hour),
+    min: Number(out.minute),
+    sec: Number(out.second),
+    wday: weekdayMap[out.weekday] ?? 0
   };
 }
 
-function isWeekend() {
-  const { wday } = getUTCComponents();
-  return wday === 0 || wday === 6;
+function dateKey(year, month, day) {
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function addDaysUtc(year, month, day, delta) {
+  const d = new Date(Date.UTC(year, month - 1, day + delta, 12, 0, 0));
+  return {
+    year: d.getUTCFullYear(),
+    month: d.getUTCMonth() + 1,
+    day: d.getUTCDate(),
+    wday: d.getUTCDay()
+  };
+}
+
+function weekdayOfDate(year, month, day) {
+  return new Date(Date.UTC(year, month - 1, day, 12, 0, 0)).getUTCDay();
+}
+
+function nthWeekdayOfMonth(year, month, weekday, nth) {
+  const first = weekdayOfDate(year, month, 1);
+  const offset = (weekday - first + 7) % 7;
+  return 1 + offset + (nth - 1) * 7;
+}
+
+function lastWeekdayOfMonth(year, month, weekday) {
+  const lastDate = new Date(Date.UTC(year, month, 0, 12, 0, 0)).getUTCDate();
+  const lastWday = weekdayOfDate(year, month, lastDate);
+  const offset = (lastWday - weekday + 7) % 7;
+  return lastDate - offset;
+}
+
+function observedFixedHolidayDate(year, month, day) {
+  const wday = weekdayOfDate(year, month, day);
+
+  if (wday === 6) return addDaysUtc(year, month, day, -1);
+  if (wday === 0) return addDaysUtc(year, month, day, 1);
+
+  return { year, month, day, wday };
+}
+
+function easterDate(year) {
+  const a = year % 19;
+  const b = Math.floor(year / 100);
+  const c = year % 100;
+  const d = Math.floor(b / 4);
+  const e = b % 4;
+  const f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3);
+  const h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4);
+  const k = c % 4;
+  const l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31);
+  const day = ((h + l - 7 * m + 114) % 31) + 1;
+
+  return { year, month, day };
+}
+
+function putHoliday(map, ymd, name) {
+  map.set(dateKey(ymd.year, ymd.month, ymd.day), name);
+}
+
+function stockMarketHolidayMapForYear(year) {
+  const map = new Map();
+
+  putHoliday(map, observedFixedHolidayDate(year, 1, 1), "New Year's Day");
+  putHoliday(map, { year, month: 1, day: nthWeekdayOfMonth(year, 1, 1, 3) }, "Martin Luther King Jr. Day");
+  putHoliday(map, { year, month: 2, day: nthWeekdayOfMonth(year, 2, 1, 3) }, "Presidents Day");
+
+  const easter = easterDate(year);
+  putHoliday(map, addDaysUtc(easter.year, easter.month, easter.day, -2), "Good Friday");
+
+  putHoliday(map, { year, month: 5, day: lastWeekdayOfMonth(year, 5, 1) }, "Memorial Day");
+  putHoliday(map, observedFixedHolidayDate(year, 6, 19), "Juneteenth");
+  putHoliday(map, observedFixedHolidayDate(year, 7, 4), "Independence Day");
+  putHoliday(map, { year, month: 9, day: nthWeekdayOfMonth(year, 9, 1, 1) }, "Labor Day");
+  putHoliday(map, { year, month: 11, day: nthWeekdayOfMonth(year, 11, 4, 4) }, "Thanksgiving Day");
+  putHoliday(map, observedFixedHolidayDate(year, 12, 25), "Christmas Day");
+
+  return map;
+}
+
+function getStockMarketHolidayName(year, month, day) {
+  const key = dateKey(year, month, day);
+
+  for (const y of [year - 1, year, year + 1]) {
+    const name = stockMarketHolidayMapForYear(y).get(key);
+    if (name) return name;
+  }
+
+  return null;
+}
+
+function isDayBeforeObservedIndependenceDay(year, month, day) {
+  const today = dateKey(year, month, day);
+  const obs = observedFixedHolidayDate(year, 7, 4);
+  const prev = addDaysUtc(obs.year, obs.month, obs.day, -1);
+  return today === dateKey(prev.year, prev.month, prev.day);
+}
+
+function isChristmasEve(year, month, day) {
+  return month === 12 && day === 24;
+}
+
+function isDayAfterThanksgiving(year, month, day) {
+  const thanks = { year, month: 11, day: nthWeekdayOfMonth(year, 11, 4, 4) };
+  const next = addDaysUtc(thanks.year, thanks.month, thanks.day, 1);
+  return dateKey(year, month, day) === dateKey(next.year, next.month, next.day);
+}
+
+function getEarlyCloseInfo(parts) {
+  if (parts.wday === 0 || parts.wday === 6) return null;
+  if (getStockMarketHolidayName(parts.year, parts.month, parts.day)) return null;
+
+  if (isDayAfterThanksgiving(parts.year, parts.month, parts.day)) {
+    return { name: "Day after Thanksgiving", regularCloseMin: 13 * 60, extendedCloseMin: 17 * 60 };
+  }
+
+  if (isChristmasEve(parts.year, parts.month, parts.day)) {
+    return { name: "Christmas Eve", regularCloseMin: 13 * 60, extendedCloseMin: 17 * 60 };
+  }
+
+  if (isDayBeforeObservedIndependenceDay(parts.year, parts.month, parts.day)) {
+    return { name: "Day before Independence Day", regularCloseMin: 13 * 60, extendedCloseMin: 17 * 60 };
+  }
+
+  return null;
+}
+
+function getMarketSessionStatus(date = new Date()) {
+  const parts = getEasternDateParts(date);
+  const totalMin = parts.hour * 60 + parts.min;
+  const key = dateKey(parts.year, parts.month, parts.day);
+  const holidayName = getStockMarketHolidayName(parts.year, parts.month, parts.day);
+  const weekend = parts.wday === 0 || parts.wday === 6;
+  const earlyClose = getEarlyCloseInfo(parts);
+  const regularCloseMin = earlyClose ? earlyClose.regularCloseMin : 16 * 60;
+  const extendedCloseMin = earlyClose ? earlyClose.extendedCloseMin : 20 * 60;
+
+  let session = "closed";
+  let label = "Market Closed";
+
+  if (holidayName) {
+    label = `Market Closed - ${holidayName}`;
+  } else if (weekend) {
+    label = "Market Closed - Weekend";
+  } else if (totalMin >= 4 * 60 && totalMin < 9 * 60 + 30) {
+    session = "pre-market";
+    label = "Pre-Market";
+  } else if (totalMin >= 9 * 60 + 30 && totalMin < regularCloseMin) {
+    session = "open";
+    label = earlyClose ? "Market Open - Early Close 1:00 PM ET" : "Market Open";
+  } else if (totalMin >= regularCloseMin && totalMin < extendedCloseMin) {
+    session = "after-hours";
+    label = "After Hours";
+  }
+
+  return {
+    session,
+    label,
+    date: key,
+    timeEt: `${String(parts.hour).padStart(2, "0")}:${String(parts.min).padStart(2, "0")}`,
+    isOpen: session === "open",
+    isRegular: session === "open",
+    isExtended: session === "pre-market" || session === "after-hours",
+    isPreMarket: session === "pre-market",
+    isAfterHours: session === "after-hours",
+    isClosed: session === "closed",
+    isWeekend: weekend,
+    isHoliday: Boolean(holidayName),
+    holidayName,
+    earlyClose: Boolean(earlyClose),
+    earlyCloseName: earlyClose && earlyClose.name,
+    regularCloseEt: earlyClose ? "1:00 PM ET" : "4:00 PM ET",
+    extendedCloseEt: earlyClose ? "5:00 PM ET" : "8:00 PM ET"
+  };
 }
 
 function isRegularMarketHours() {
-  if (isWeekend()) return false;
-
-  const { hour, min } = getUTCComponents();
-  const totalMin = hour * 60 + min;
-
-  return totalMin >= (14 * 60 + 30) && totalMin < (21 * 60);
+  return getMarketSessionStatus().session === "open";
 }
 
 function isExtendedHours() {
-  if (isWeekend()) return false;
+  const session = getMarketSessionStatus().session;
+  return session === "pre-market" || session === "after-hours";
+}
 
-  const { hour, min } = getUTCComponents();
-  const totalMin = hour * 60 + min;
-
-  return (
-    (totalMin >= (8 * 60) && totalMin < (14 * 60 + 30)) ||
-    (totalMin >= (20 * 60) && totalMin < (23 * 60))
-  );
+function isTradingAllowed() {
+  const session = getMarketSessionStatus().session;
+  return session === "pre-market" || session === "open" || session === "after-hours";
 }
 
 // ============================
@@ -255,6 +445,168 @@ async function pollTwelveDataBatch() {
   } catch (e) {
     console.error("[12DATA] Batch poll failed", e.message);
   }
+}
+
+// ============================
+// Yahoo Finance quote polling (regular + pre/post market)
+// ============================
+const ENABLE_YAHOO_QUOTES = process.env.ENABLE_YAHOO_QUOTES !== "false";
+const YAHOO_QUOTE_BATCH_SIZE = Number(process.env.YAHOO_QUOTE_BATCH_SIZE || 10);
+const YAHOO_QUOTE_POLL_MS = Number(process.env.YAHOO_QUOTE_POLL_MS || 2500);
+
+let yahooQuoteBatchIndex = 0;
+
+function getYahooDisplayPrice(row) {
+  if (!row || typeof row !== "object") return null;
+
+  const state = String(row.marketState || "").toUpperCase();
+  const regularPrice = toNumber(row.regularMarketPrice);
+  const prePrice = toNumber(row.preMarketPrice);
+  const postPrice = toNumber(row.postMarketPrice);
+  const regularTime = toNumber(row.regularMarketTime) || 0;
+  const preTime = toNumber(row.preMarketTime) || 0;
+  const postTime = toNumber(row.postMarketTime) || 0;
+
+  if (state === "PRE" && prePrice && prePrice > 0) {
+    return { price: prePrice, source: "Yahoo Finance pre-market", marketState: "PRE", time: preTime || Math.floor(Date.now() / 1000) };
+  }
+
+  if ((state === "POST" || state === "POSTPOST") && postPrice && postPrice > 0) {
+    return { price: postPrice, source: "Yahoo Finance after-hours", marketState: state, time: postTime || Math.floor(Date.now() / 1000) };
+  }
+
+  if (state === "REGULAR" && regularPrice && regularPrice > 0) {
+    return { price: regularPrice, source: "Yahoo Finance regular", marketState: "REGULAR", time: regularTime || Math.floor(Date.now() / 1000) };
+  }
+
+  if (postPrice && postPrice > 0 && postTime >= Math.max(regularTime, preTime)) {
+    return { price: postPrice, source: "Yahoo Finance after-hours", marketState: state || "POST", time: postTime || Math.floor(Date.now() / 1000) };
+  }
+
+  if (prePrice && prePrice > 0 && preTime >= Math.max(regularTime, postTime)) {
+    return { price: prePrice, source: "Yahoo Finance pre-market", marketState: state || "PRE", time: preTime || Math.floor(Date.now() / 1000) };
+  }
+
+  if (regularPrice && regularPrice > 0) {
+    return { price: regularPrice, source: "Yahoo Finance regular", marketState: state || "REGULAR", time: regularTime || Math.floor(Date.now() / 1000) };
+  }
+
+  return null;
+}
+
+function applyYahooQuoteToCache(requestedTicker, row) {
+  const selected = getYahooDisplayPrice(row);
+  if (!selected || !selected.price || selected.price <= 0) return false;
+
+  const ticker = String(requestedTicker || row.symbol || "").toUpperCase().replace("-", ".");
+  const existing = priceCache[ticker];
+  const prevClose =
+    toNumber(row.regularMarketPreviousClose) ||
+    toNumber(row.regularMarketPreviousDayClose) ||
+    (existing && toNumber(existing.prevClose)) ||
+    selected.price;
+
+  const changePct = prevClose
+    ? (((selected.price - prevClose) / prevClose) * 100).toFixed(2)
+    : "0.00";
+
+  priceCache[ticker] = {
+    price: selected.price,
+    prevClose,
+    changePct,
+    source: selected.source,
+    marketState: selected.marketState,
+    lastUpdated: selected.time || Math.floor(Date.now() / 1000)
+  };
+
+  return true;
+}
+
+async function fetchYahooQuotes(symbols) {
+  const requested = symbols
+    .map(symbol => String(symbol || "").toUpperCase())
+    .filter(Boolean);
+
+  if (requested.length === 0) return 0;
+
+  const yahooSymbols = requested.map(yahooTickerSymbol);
+  const url =
+    `https://query1.finance.yahoo.com/v7/finance/quote` +
+    `?symbols=${encodeURIComponent(yahooSymbols.join(","))}`;
+
+  const resp = await fetchJsonWithTimeout(
+    url,
+    {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "Mozilla/5.0"
+      }
+    },
+    10000
+  );
+
+  if (!resp.ok) {
+    throw new Error(resp.data?.finance?.error?.description || `Yahoo quote HTTP ${resp.status}`);
+  }
+
+  const rows = resp.data?.quoteResponse?.result;
+  if (!Array.isArray(rows) || rows.length === 0) return 0;
+
+  const byYahooSymbol = new Map();
+  rows.forEach(row => {
+    if (row && row.symbol) byYahooSymbol.set(String(row.symbol).toUpperCase(), row);
+  });
+
+  let updated = 0;
+
+  requested.forEach((ticker, i) => {
+    const row = byYahooSymbol.get(yahooSymbols[i].toUpperCase());
+    if (row && applyYahooQuoteToCache(ticker, row)) updated++;
+  });
+
+  return updated;
+}
+
+async function pollYahooQuoteBatch() {
+  if (!ENABLE_YAHOO_QUOTES) return;
+
+  const start = yahooQuoteBatchIndex * YAHOO_QUOTE_BATCH_SIZE;
+  const batch = TICKERS.slice(start, start + YAHOO_QUOTE_BATCH_SIZE);
+
+  yahooQuoteBatchIndex =
+    (yahooQuoteBatchIndex + 1) % Math.ceil(TICKERS.length / YAHOO_QUOTE_BATCH_SIZE);
+
+  if (batch.length === 0) return;
+
+  try {
+    const updated = await fetchYahooQuotes(batch);
+    if (updated > 0) {
+      console.log(`[YAHOO] Updated ${updated}/${batch.length} stock quotes`);
+    }
+  } catch (e) {
+    console.error("[YAHOO] Quote poll failed", e.message);
+  }
+}
+
+async function warmYahooQuotes() {
+  if (!ENABLE_YAHOO_QUOTES) return;
+
+  const batchCount = Math.ceil(TICKERS.length / YAHOO_QUOTE_BATCH_SIZE);
+
+  for (let i = 0; i < batchCount; i++) {
+    await pollYahooQuoteBatch();
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+}
+
+function startYahooQuotePolling() {
+  if (!ENABLE_YAHOO_QUOTES) {
+    console.log("[YAHOO] Quote polling disabled. Set ENABLE_YAHOO_QUOTES=true or remove ENABLE_YAHOO_QUOTES=false to enable it.");
+    return;
+  }
+
+  pollYahooQuoteBatch();
+  setInterval(pollYahooQuoteBatch, Math.max(1000, YAHOO_QUOTE_POLL_MS));
 }
 
 // ============================
@@ -622,7 +974,7 @@ async function fetchYahooStockCandles(ticker, interval, limit = 200) {
     `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}` +
     `?range=${encodeURIComponent(cfg.range)}` +
     `&interval=${encodeURIComponent(cfg.interval)}` +
-    `&includePrePost=false`;
+    `&includePrePost=true`;
 
   const resp = await fetchJsonWithTimeout(
     url,
@@ -1512,8 +1864,13 @@ app.get("/health", (req, res) => {
     cryptoSourceSample: cryptoPriceCache.BTC && cryptoPriceCache.BTC.source,
     cryptoCandleCacheEntries: Object.keys(cryptoCandleCache).length,
     isRegularMarketHours: isRegularMarketHours(),
-    isExtendedHours: isExtendedHours()
+    isExtendedHours: isExtendedHours(),
+    marketStatus: getMarketSessionStatus()
   });
+});
+
+app.get("/market/status", (req, res) => {
+  res.json(getMarketSessionStatus());
 });
 
 app.get("/crypto/prices", async (req, res) => {
@@ -1594,9 +1951,17 @@ app.get("/prices", (req, res) => {
   res.json(priceCache);
 });
 
-app.get("/price", (req, res) => {
+app.get("/price", async (req, res) => {
   const ticker = String(req.query.ticker || "").toUpperCase();
-  const data = priceCache[ticker];
+  let data = priceCache[ticker];
+  const age = data && data.lastUpdated ? Math.floor(Date.now() / 1000) - data.lastUpdated : Infinity;
+
+  if ((!data || age > 20) && ENABLE_YAHOO_QUOTES) {
+    try {
+      await fetchYahooQuotes([ticker]);
+      data = priceCache[ticker];
+    } catch (_) {}
+  }
 
   res.json(
     data
@@ -1646,7 +2011,8 @@ app.get("/candles", async (req, res) => {
 
   // Primary stock chart path: Yahoo Finance chart data. This avoids burning
   // Twelve Data API credits just from players opening charts. The returned
-  // timestamps are formatted in UTC; the Roblox LocalScript displays them as ET.
+  // includePrePost=true brings pre-market and after-hours candles into the same chart.
+  // Timestamps are formatted in UTC; the Roblox LocalScript displays them as ET.
   try {
     const yahooCandles = await fetchYahooStockCandles(ticker, tdInterval, outputsize);
     setCachedCandles(ticker, tdInterval, yahooCandles);
@@ -1803,6 +2169,7 @@ app.get("/candles", async (req, res) => {
 // ============================
 async function start() {
   await seedPrevClose();
+  await warmYahooQuotes();
 
   if (ENABLE_TWELVE_DATA_POLLING && isExtendedHours()) {
     console.log("[INIT] Extended hours detected, running initial Twelve Data poll...");
@@ -1815,6 +2182,7 @@ async function start() {
 
   connectFinnhub();
   startFinnhubRestPolling();
+  startYahooQuotePolling();
 
   if (ENABLE_TWELVE_DATA_POLLING) {
     startTwelveDataPolling();
