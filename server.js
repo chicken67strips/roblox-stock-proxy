@@ -390,7 +390,7 @@ function setCachedCandles(ticker, interval, data) {
 const CRYPTO_SYMBOLS = ["BTC", "ETH", "SOL", "DOGE", "LTC"];
 const cryptoPriceCache = {}; // symbol -> { symbol, name, price, change24h, marketCap, volume24h, lastUpdated, source }
 let cryptoCacheFetchedAt = 0;
-const CRYPTO_CACHE_TTL_MS = 10 * 1000;
+const CRYPTO_CACHE_TTL_MS = 4500; // just under 5s so a 5-second Roblox poll gets fresh proxy data
 
 const CRYPTO_NAMES = {
   BTC: "Bitcoin",
