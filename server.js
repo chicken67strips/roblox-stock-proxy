@@ -17,6 +17,15 @@ const TICKERS = [
   "MASK", "MNTS", "DSY", "INHD", "CLDI", "AZI", "DXST", "WCT", "AIXI", "CODX", "GOVX", "CHAI", "CDLX", "DCX", "CLPR"
 ];
 
+const REAL_STOCK_TICKERS = new Set([
+  "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "BRK.B", "AVGO", "LLY", "JPM", "V", "WMT", "UNH", "XOM",
+  "AMD", "NFLX", "CRM", "ADBE", "ORCL", "COST", "DIS", "BA", "NKE", "PYPL", "INTC", "UBER", "ABNB", "SBUX", "KO"
+]);
+
+function isRealStockTicker(ticker) {
+  return REAL_STOCK_TICKERS.has(String(ticker || "").toUpperCase());
+}
+
 let wsReady = false;
 let wsInstance = null;
 let lastWsTradeTime = 0;
@@ -371,10 +380,12 @@ let lastCreditReset = new Date().toDateString();
 const MAX_CREDITS_PER_DAY = Number(process.env.TWELVE_DATA_MAX_CREDITS_PER_DAY || 50);
 
 // Background Twelve Data quote polling is OFF by default; it was burning daily credits without players opening charts.
-// Stock candles use Yahoo Finance first and synthetic fallback by default, which uses zero Twelve Data candle credits.
-// Set ENABLE_TWELVE_DATA_CANDLES=true only if you explicitly want Twelve Data as a fallback.
+// Stock candles use Yahoo Finance first. During regular market hours, Twelve Data is now ready as the backup
+// for real stock tickers only if Yahoo fails. Fake/project tickers still go straight to synthetic candles.
+// Set ENABLE_TWELVE_DATA_CANDLES=true if you want Twelve Data as a fallback outside regular market hours too.
 const ENABLE_TWELVE_DATA_POLLING = process.env.ENABLE_TWELVE_DATA_POLLING === "true";
 const ENABLE_TWELVE_DATA_CANDLES = process.env.ENABLE_TWELVE_DATA_CANDLES === "true";
+const ENABLE_TWELVE_DATA_MARKET_CANDLE_BACKUP = process.env.ENABLE_TWELVE_DATA_MARKET_CANDLE_BACKUP !== "false";
 
 function resetCreditsIfNewDay() {
   const today = new Date().toDateString();
@@ -846,6 +857,12 @@ const MAX_TWELVE_DATA_CANDLE_CREDITS_PER_DAY = Number(process.env.TWELVE_DATA_MA
 
 function getCandleTTL(interval) {
   return CANDLE_TTL_MS[interval] || DEFAULT_CANDLE_TTL_MS;
+}
+
+function shouldUseTwelveDataCandleBackup(ticker) {
+  if (!isRealStockTicker(ticker)) return false;
+  if (ENABLE_TWELVE_DATA_CANDLES) return true;
+  return ENABLE_TWELVE_DATA_MARKET_CANDLE_BACKUP && isRegularMarketHours();
 }
 
 function getCachedCandles(ticker, interval) {
@@ -1969,6 +1986,7 @@ app.get("/health", (req, res) => {
     maxTwelveDataCandleCreditsPerDay: MAX_TWELVE_DATA_CANDLE_CREDITS_PER_DAY,
     twelveDataPollingEnabled: ENABLE_TWELVE_DATA_POLLING,
     twelveDataCandlesEnabled: ENABLE_TWELVE_DATA_CANDLES,
+    twelveDataMarketCandleBackupEnabled: ENABLE_TWELVE_DATA_MARKET_CANDLE_BACKUP,
     twelveDataQueueDepth: tdQueueDepth(),
     twelveDataCallsInLastMinute: tdCallsInLastMinute(),
     candleCacheEntries: Object.keys(candleCache).length,
@@ -2165,9 +2183,9 @@ app.get("/candles", async (req, res) => {
       source: "Yahoo Finance"
     });
   } catch (yahooErr) {
-    // Fake/project tickers will not exist on Yahoo. Fall through to either
-    // optional Twelve Data, or zero-credit synthetic candles.
-    if (!ENABLE_TWELVE_DATA_CANDLES) {
+    // Fake/project tickers will not exist on Yahoo. They go straight to zero-credit synthetic candles.
+    // Real stocks use Twelve Data as a regular-market backup when Yahoo fails.
+    if (!shouldUseTwelveDataCandleBackup(ticker)) {
       const generated = generateSyntheticStockCandles(ticker, tdInterval, outputsize);
 
       if (generated.error) {
@@ -2185,7 +2203,7 @@ app.get("/candles", async (req, res) => {
         synthetic: true,
         source: generated.source,
         providerError: yahooErr.message,
-        note: "Yahoo did not return usable stock candles, and Twelve Data stock candles are disabled. Synthetic candles used zero Twelve Data credits."
+        note: "Yahoo did not return usable stock candles. Twelve Data backup was skipped because this is a fake ticker, outside regular market hours, or disabled. Synthetic candles used zero Twelve Data credits."
       });
     }
   }
