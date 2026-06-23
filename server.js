@@ -450,11 +450,19 @@ async function pollTwelveDataBatch() {
 // ============================
 // Yahoo Finance quote polling (regular + pre/post market)
 // ============================
-const ENABLE_YAHOO_QUOTES = process.env.ENABLE_YAHOO_QUOTES !== "false";
+// On-demand Yahoo quote refresh is enabled by default. Background polling is OFF by default.
+// This keeps Roblox servers fast while preventing every server from constantly burning proxy traffic.
+const ENABLE_YAHOO_ON_DEMAND_QUOTES = process.env.ENABLE_YAHOO_ON_DEMAND_QUOTES !== "false";
+const ENABLE_YAHOO_QUOTE_POLLING = process.env.ENABLE_YAHOO_QUOTE_POLLING === "true";
 const YAHOO_QUOTE_BATCH_SIZE = Number(process.env.YAHOO_QUOTE_BATCH_SIZE || 10);
 const YAHOO_QUOTE_POLL_MS = Number(process.env.YAHOO_QUOTE_POLL_MS || 2500);
+const PRICE_CACHE_TTL_MS = Number(process.env.PRICE_CACHE_TTL_MS || 15000);
+const PRICE_CACHE_MAX_STALE_MS = Number(process.env.PRICE_CACHE_MAX_STALE_MS || 2 * 60 * 1000);
 
 let yahooQuoteBatchIndex = 0;
+let allYahooQuotesFetchedAtMs = 0;
+let allYahooQuotesRefreshInFlight = null;
+const yahooQuoteInFlight = new Map();
 
 function getYahooDisplayPrice(row) {
   if (!row || typeof row !== "object") return null;
@@ -516,7 +524,8 @@ function applyYahooQuoteToCache(requestedTicker, row) {
     changePct,
     source: selected.source,
     marketState: selected.marketState,
-    lastUpdated: selected.time || Math.floor(Date.now() / 1000)
+    lastUpdated: selected.time || Math.floor(Date.now() / 1000),
+    fetchedAt: Date.now()
   };
 
   return true;
@@ -567,8 +576,95 @@ async function fetchYahooQuotes(symbols) {
   return updated;
 }
 
+
+function yahooQuoteRequestKey(symbols) {
+  return symbols
+    .map(symbol => String(symbol || "").toUpperCase())
+    .filter(Boolean)
+    .sort()
+    .join(",");
+}
+
+function quoteCacheAgeMs(ticker) {
+  const data = priceCache[String(ticker || "").toUpperCase()];
+  if (!data || !data.fetchedAt) return Infinity;
+  return Date.now() - data.fetchedAt;
+}
+
+async function fetchYahooQuotesDeduped(symbols) {
+  if (!ENABLE_YAHOO_ON_DEMAND_QUOTES && !ENABLE_YAHOO_QUOTE_POLLING) return 0;
+
+  const requested = symbols
+    .map(symbol => String(symbol || "").toUpperCase())
+    .filter(Boolean);
+
+  if (requested.length === 0) return 0;
+
+  const key = yahooQuoteRequestKey(requested);
+
+  if (yahooQuoteInFlight.has(key)) {
+    return yahooQuoteInFlight.get(key);
+  }
+
+  const promise = fetchYahooQuotes(requested)
+    .finally(() => {
+      yahooQuoteInFlight.delete(key);
+    });
+
+  yahooQuoteInFlight.set(key, promise);
+  return promise;
+}
+
+async function refreshAllYahooQuotes() {
+  if (!ENABLE_YAHOO_ON_DEMAND_QUOTES && !ENABLE_YAHOO_QUOTE_POLLING) return 0;
+
+  let updated = 0;
+
+  for (let i = 0; i < TICKERS.length; i += YAHOO_QUOTE_BATCH_SIZE) {
+    const batch = TICKERS.slice(i, i + YAHOO_QUOTE_BATCH_SIZE);
+    updated += await fetchYahooQuotesDeduped(batch);
+  }
+
+  allYahooQuotesFetchedAtMs = Date.now();
+  return updated;
+}
+
+function triggerAllYahooQuoteRefresh() {
+  if (!ENABLE_YAHOO_ON_DEMAND_QUOTES) return null;
+
+  const now = Date.now();
+
+  if (allYahooQuotesRefreshInFlight) return allYahooQuotesRefreshInFlight;
+  if (now - allYahooQuotesFetchedAtMs < PRICE_CACHE_TTL_MS) return null;
+
+  allYahooQuotesRefreshInFlight = refreshAllYahooQuotes()
+    .catch(err => {
+      console.error("[YAHOO] On-demand all quote refresh failed", err.message);
+      return 0;
+    })
+    .finally(() => {
+      allYahooQuotesRefreshInFlight = null;
+    });
+
+  return allYahooQuotesRefreshInFlight;
+}
+
+function triggerYahooQuoteRefresh(symbols) {
+  if (!ENABLE_YAHOO_ON_DEMAND_QUOTES) return;
+
+  const staleSymbols = symbols
+    .map(symbol => String(symbol || "").toUpperCase())
+    .filter(symbol => symbol && quoteCacheAgeMs(symbol) > PRICE_CACHE_TTL_MS);
+
+  if (staleSymbols.length === 0) return;
+
+  fetchYahooQuotesDeduped(staleSymbols).catch(err => {
+    console.error("[YAHOO] On-demand quote refresh failed", err.message);
+  });
+}
+
 async function pollYahooQuoteBatch() {
-  if (!ENABLE_YAHOO_QUOTES) return;
+  if (!ENABLE_YAHOO_QUOTE_POLLING) return;
 
   const start = yahooQuoteBatchIndex * YAHOO_QUOTE_BATCH_SIZE;
   const batch = TICKERS.slice(start, start + YAHOO_QUOTE_BATCH_SIZE);
@@ -579,7 +675,7 @@ async function pollYahooQuoteBatch() {
   if (batch.length === 0) return;
 
   try {
-    const updated = await fetchYahooQuotes(batch);
+    const updated = await fetchYahooQuotesDeduped(batch);
     if (updated > 0) {
       console.log(`[YAHOO] Updated ${updated}/${batch.length} stock quotes`);
     }
@@ -589,19 +685,13 @@ async function pollYahooQuoteBatch() {
 }
 
 async function warmYahooQuotes() {
-  if (!ENABLE_YAHOO_QUOTES) return;
-
-  const batchCount = Math.ceil(TICKERS.length / YAHOO_QUOTE_BATCH_SIZE);
-
-  for (let i = 0; i < batchCount; i++) {
-    await pollYahooQuoteBatch();
-    await new Promise(resolve => setTimeout(resolve, 250));
-  }
+  if (!ENABLE_YAHOO_ON_DEMAND_QUOTES && !ENABLE_YAHOO_QUOTE_POLLING) return;
+  await refreshAllYahooQuotes();
 }
 
 function startYahooQuotePolling() {
-  if (!ENABLE_YAHOO_QUOTES) {
-    console.log("[YAHOO] Quote polling disabled. Set ENABLE_YAHOO_QUOTES=true or remove ENABLE_YAHOO_QUOTES=false to enable it.");
+  if (!ENABLE_YAHOO_QUOTE_POLLING) {
+    console.log("[YAHOO] Background quote polling disabled. Set ENABLE_YAHOO_QUOTE_POLLING=true to re-enable it.");
     return;
   }
 
@@ -778,6 +868,28 @@ function setCachedCandles(ticker, interval, data) {
     data,
     fetchedAt: Date.now()
   };
+}
+
+const stockCandleInFlight = new Map();
+
+async function fetchYahooStockCandlesDeduped(ticker, interval, limit) {
+  const key = `${ticker}:${interval}:${limit}`;
+
+  if (stockCandleInFlight.has(key)) {
+    return stockCandleInFlight.get(key);
+  }
+
+  const promise = fetchYahooStockCandles(ticker, interval, limit)
+    .then(candles => {
+      setCachedCandles(ticker, interval, candles);
+      return candles;
+    })
+    .finally(() => {
+      stockCandleInFlight.delete(key);
+    });
+
+  stockCandleInFlight.set(key, promise);
+  return promise;
 }
 
 
@@ -1863,6 +1975,11 @@ app.get("/health", (req, res) => {
     cryptoCached: Object.keys(cryptoPriceCache).length,
     cryptoSourceSample: cryptoPriceCache.BTC && cryptoPriceCache.BTC.source,
     cryptoCandleCacheEntries: Object.keys(cryptoCandleCache).length,
+    yahooOnDemandQuotes: ENABLE_YAHOO_ON_DEMAND_QUOTES,
+    yahooBackgroundPolling: ENABLE_YAHOO_QUOTE_POLLING,
+    allYahooQuotesMsAgo: allYahooQuotesFetchedAtMs ? Date.now() - allYahooQuotesFetchedAtMs : null,
+    yahooQuoteInFlight: yahooQuoteInFlight.size,
+    stockCandleInFlight: stockCandleInFlight.size,
     isRegularMarketHours: isRegularMarketHours(),
     isExtendedHours: isExtendedHours(),
     marketStatus: getMarketSessionStatus()
@@ -1947,20 +2064,40 @@ app.get("/crypto/debug", async (req, res) => {
   });
 });
 
-app.get("/prices", (req, res) => {
+app.get("/prices", async (req, res) => {
+  const cacheEmpty = Object.keys(priceCache).length === 0;
+
+  if (ENABLE_YAHOO_ON_DEMAND_QUOTES) {
+    if (cacheEmpty) {
+      try {
+        await refreshAllYahooQuotes();
+      } catch (e) {
+        console.error("[YAHOO] Initial /prices refresh failed", e.message);
+      }
+    } else {
+      triggerAllYahooQuoteRefresh();
+    }
+  }
+
   res.json(priceCache);
 });
 
 app.get("/price", async (req, res) => {
   const ticker = String(req.query.ticker || "").toUpperCase();
-  let data = priceCache[ticker];
-  const age = data && data.lastUpdated ? Math.floor(Date.now() / 1000) - data.lastUpdated : Infinity;
+  const wantsFresh = req.query.fresh === "1" || req.query.fresh === "true";
 
-  if ((!data || age > 20) && ENABLE_YAHOO_QUOTES) {
-    try {
-      await fetchYahooQuotes([ticker]);
-      data = priceCache[ticker];
-    } catch (_) {}
+  let data = priceCache[ticker];
+  const ageMs = data && data.fetchedAt ? Date.now() - data.fetchedAt : Infinity;
+
+  if (ENABLE_YAHOO_ON_DEMAND_QUOTES) {
+    if (!data || wantsFresh || ageMs > PRICE_CACHE_MAX_STALE_MS) {
+      try {
+        await fetchYahooQuotesDeduped([ticker]);
+        data = priceCache[ticker];
+      } catch (_) {}
+    } else if (ageMs > PRICE_CACHE_TTL_MS) {
+      triggerYahooQuoteRefresh([ticker]);
+    }
   }
 
   res.json(
@@ -2000,6 +2137,8 @@ app.get("/candles", async (req, res) => {
   const cached = getCachedCandles(ticker, tdInterval);
 
   if (cached) {
+    triggerYahooQuoteRefresh([ticker]);
+
     return res.json({
       ticker,
       interval: tdInterval,
@@ -2014,8 +2153,7 @@ app.get("/candles", async (req, res) => {
   // includePrePost=true brings pre-market and after-hours candles into the same chart.
   // Timestamps are formatted in UTC; the Roblox LocalScript displays them as ET.
   try {
-    const yahooCandles = await fetchYahooStockCandles(ticker, tdInterval, outputsize);
-    setCachedCandles(ticker, tdInterval, yahooCandles);
+    const yahooCandles = await fetchYahooStockCandlesDeduped(ticker, tdInterval, outputsize);
 
     return res.json({
       ticker,
@@ -2169,7 +2307,10 @@ app.get("/candles", async (req, res) => {
 // ============================
 async function start() {
   await seedPrevClose();
-  await warmYahooQuotes();
+
+  if (process.env.WARM_YAHOO_QUOTES === "true") {
+    await warmYahooQuotes();
+  }
 
   if (ENABLE_TWELVE_DATA_POLLING && isExtendedHours()) {
     console.log("[INIT] Extended hours detected, running initial Twelve Data poll...");
