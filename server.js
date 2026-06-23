@@ -12,18 +12,66 @@ const FREECRYPTO_BASE_URL = "https://api.freecryptoapi.com/v1";
 const priceCache = {};
 
 const TICKERS = [
-  "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "BRK.B", "AVGO", "LLY", "JPM", "V", "WMT", "UNH", "XOM",
-  "AMD", "NFLX", "CRM", "ADBE", "ORCL", "COST", "DIS", "BA", "NKE", "PYPL", "INTC", "UBER", "ABNB", "SBUX", "KO",
+  "ORNG", "MHRD", "MVDO", "AMZG", "ELPHT", "DATA", "NKLA", "BKSG", "HCC", "ELLY", "PMK", "M", "FMT", "DVS", "WXM",
+  "ABMD", "NFKS", "BUM", "DGBE", "REVL", "MNEY", "VKNEE", "BEAR", "NICY", "PPL", "INFO", "OVER", "WBAB", "SMNY", "BC",
   "MASK", "MNTS", "DSY", "INHD", "CLDI", "AZI", "DXST", "WCT", "AIXI", "CODX", "GOVX", "CHAI", "CDLX", "DCX", "CLPR"
 ];
 
-const REAL_STOCK_TICKERS = new Set([
-  "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "BRK.B", "AVGO", "LLY", "JPM", "V", "WMT", "UNH", "XOM",
-  "AMD", "NFLX", "CRM", "ADBE", "ORCL", "COST", "DIS", "BA", "NKE", "PYPL", "INTC", "UBER", "ABNB", "SBUX", "KO"
-]);
+const DISPLAY_TICKER_TO_REAL_TICKER = {
+  ORNG: "AAPL",
+  MHRD: "MSFT",
+  MVDO: "NVDA",
+  AMZG: "AMZN",
+  ELPHT: "GOOGL",
+  DATA: "META",
+  NKLA: "TSLA",
+  BKSG: "BRK.B",
+  HCC: "AVGO",
+  ELLY: "LLY",
+  PMK: "JPM",
+  M: "V",
+  FMT: "WMT",
+  DVS: "UNH",
+  WXM: "XOM",
+  ABMD: "AMD",
+  NFKS: "NFLX",
+  BUM: "CRM",
+  DGBE: "ADBE",
+  REVL: "ORCL",
+  MNEY: "COST",
+  VKNEE: "DIS",
+  BEAR: "BA",
+  NICY: "NKE",
+  PPL: "PYPL",
+  INFO: "INTC",
+  OVER: "UBER",
+  WBAB: "ABNB",
+  SMNY: "SBUX",
+  BC: "KO"
+};
+
+const REAL_TICKER_TO_DISPLAY_TICKER = Object.fromEntries(
+  Object.entries(DISPLAY_TICKER_TO_REAL_TICKER).map(([displayTicker, realTicker]) => [realTicker, displayTicker])
+);
+
+const REAL_STOCK_TICKERS = new Set(Object.values(DISPLAY_TICKER_TO_REAL_TICKER));
+
+function normalizeStockTicker(ticker) {
+  return String(ticker || "").toUpperCase().replace(/[^A-Z0-9.]/g, "");
+}
+
+function getRealTicker(displayTicker) {
+  const normalized = normalizeStockTicker(displayTicker);
+  return DISPLAY_TICKER_TO_REAL_TICKER[normalized] || normalized;
+}
+
+function getDisplayTicker(realTicker) {
+  const normalized = normalizeStockTicker(realTicker);
+  return REAL_TICKER_TO_DISPLAY_TICKER[normalized] || normalized;
+}
 
 function isRealStockTicker(ticker) {
-  return REAL_STOCK_TICKERS.has(String(ticker || "").toUpperCase());
+  return REAL_STOCK_TICKERS.has(getRealTicker(ticker));
 }
 
 let wsReady = false;
@@ -268,7 +316,8 @@ async function seedPrevClose() {
 
   for (const ticker of TICKERS) {
     try {
-      const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${FINNHUB_API_KEY}`);
+      const realTicker = getRealTicker(ticker);
+      const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${realTicker}&token=${FINNHUB_API_KEY}`);
       const data = await res.json();
 
       if (data.c || data.pc) {
@@ -415,7 +464,8 @@ async function pollTwelveDataBatch() {
   if (batch.length === 0) return;
 
   try {
-    const symbols = batch.join(",");
+    const realSymbols = batch.map(getRealTicker);
+    const symbols = realSymbols.join(",");
     const url = `https://api.twelvedata.com/quote?symbol=${symbols}&apikey=${TWELVE_DATA_API_KEY}`;
     const data = await tdRequest(url, TD_PRIORITY.quote);
 
@@ -424,7 +474,8 @@ async function pollTwelveDataBatch() {
     let updated = 0;
 
     for (const ticker of batch) {
-      const quote = results[ticker];
+      const realTicker = getRealTicker(ticker);
+      const quote = results[realTicker] || results[yahooTickerSymbol(realTicker)] || results[ticker];
       if (!quote || quote.status === "error" || !quote.close) continue;
 
       const price = parseFloat(quote.close);
@@ -719,7 +770,7 @@ function handleTradeMessage(msg) {
   lastWsTradeTime = Date.now();
 
   for (const trade of msg.data) {
-    const ticker = trade.s;
+    const ticker = getDisplayTicker(trade.s);
     const price = trade.p;
 
     if (!ticker || typeof price !== "number") continue;
@@ -751,7 +802,7 @@ function connectFinnhub() {
     TICKERS.forEach(ticker => {
       ws.send(JSON.stringify({
         type: "subscribe",
-        symbol: ticker
+        symbol: getRealTicker(ticker)
       }));
     });
   });
@@ -795,11 +846,12 @@ function startFinnhubRestPolling() {
     if (!isRegularMarketHours()) return;
 
     const ticker = TICKERS[finnhubTickerIndex % TICKERS.length];
+    const realTicker = getRealTicker(ticker);
     finnhubTickerIndex++;
 
     (async () => {
       try {
-        const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${FINNHUB_API_KEY}`);
+        const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${realTicker}&token=${FINNHUB_API_KEY}`);
         const data = await res.json();
 
         if (data.c) {
@@ -1088,7 +1140,7 @@ const YAHOO_INTERVALS = {
 };
 
 function yahooTickerSymbol(ticker) {
-  return String(ticker || "").toUpperCase().replace(".", "-");
+  return getRealTicker(ticker).replace(".", "-");
 }
 
 async function fetchYahooStockCandles(ticker, interval, limit = 200) {
@@ -2248,9 +2300,10 @@ app.get("/candles", async (req, res) => {
     });
   }
 
+  const realTicker = getRealTicker(ticker);
   const url =
     `https://api.twelvedata.com/time_series` +
-    `?symbol=${ticker}` +
+    `?symbol=${realTicker}` +
     `&interval=${tdInterval}` +
     `&outputsize=${outputsize}` +
     `&apikey=${TWELVE_DATA_API_KEY}`;
