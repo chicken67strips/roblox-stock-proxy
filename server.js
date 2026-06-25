@@ -2138,14 +2138,19 @@ app.get("/crypto/debug", async (req, res) => {
 });
 
 app.get("/prices", async (req, res) => {
+  const wantsFresh = req.query.fresh === "1" || req.query.fresh === "true";
   const cacheEmpty = Object.keys(priceCache).length === 0;
+  const cacheHasAllTickers = TICKERS.every(ticker => {
+    const row = priceCache[ticker];
+    return row && Number(row.price) > 0;
+  });
 
   if (ENABLE_YAHOO_ON_DEMAND_QUOTES) {
-    if (cacheEmpty) {
+    if (wantsFresh || cacheEmpty || !cacheHasAllTickers) {
       try {
         await refreshAllYahooQuotes();
       } catch (e) {
-        console.error("[YAHOO] Initial /prices refresh failed", e.message);
+        console.error("[YAHOO] /prices refresh failed", e.message);
       }
     } else {
       triggerAllYahooQuoteRefresh();
@@ -2382,8 +2387,12 @@ app.get("/candles", async (req, res) => {
 async function start() {
   await seedPrevClose();
 
-  if (process.env.WARM_YAHOO_QUOTES === "true") {
-    await warmYahooQuotes();
+  // Keep the stock list warm before players ask Roblox for prices.
+  // This avoids players joining into a mostly-$0.00 list while the cache is still being filled.
+  if (process.env.WARM_YAHOO_QUOTES !== "false") {
+    warmYahooQuotes()
+      .then(updated => console.log(`[YAHOO] Warmed ${updated} quotes on startup`))
+      .catch(err => console.error("[YAHOO] Startup warm failed", err.message));
   }
 
   if (ENABLE_TWELVE_DATA_POLLING && isExtendedHours()) {
