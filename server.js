@@ -1158,7 +1158,7 @@ async function fetchYahooStockCandles(ticker, interval, limit = 200) {
     `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}` +
     `?range=${encodeURIComponent(cfg.range)}` +
     `&interval=${encodeURIComponent(cfg.interval)}` +
-    `&includePrePost=true`;
+    `&includePrePost=false`;
 
   const resp = await fetchJsonWithTimeout(
     url,
@@ -2227,8 +2227,8 @@ app.get("/candles", async (req, res) => {
   }
 
   // Primary stock chart path: Yahoo Finance chart data. This avoids burning
-  // Twelve Data API credits just from players opening charts. The returned
-  // includePrePost=true brings pre-market and after-hours candles into the same chart.
+  // Twelve Data API credits just from players opening charts. Pre-market and
+  // after-hours candles are excluded to reduce sparse intraday chart gaps.
   // Timestamps are formatted in UTC; the Roblox LocalScript displays them as ET.
   try {
     const yahooCandles = await fetchYahooStockCandlesDeduped(ticker, tdInterval, outputsize);
