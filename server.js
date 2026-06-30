@@ -51,14 +51,33 @@ const DISPLAY_TICKER_TO_REAL_TICKER = {
   SMNY: "SBUX",
   BC: "KO",
   CHHD: "SCHD",
-  VSS: "VOO"
+  VSS: "VOO",
+  MASK: "MASK",
+  MNTS: "MNTS",
+  DSY: "DSY",
+  INHD: "INHD",
+  CLDI: "CLDI",
+  AZI: "AZI",
+  DXST: "DXST",
+  WCT: "WCT",
+  AIXI: "AIXI",
+  CODX: "CODX",
+  GOVX: "GOVX",
+  CHAI: "CHAI",
+  CDLX: "CDLX",
+  DCX: "DCX",
+  CLPR: "CLPR"
 };
 
 const REAL_TICKER_TO_DISPLAY_TICKER = Object.fromEntries(
   Object.entries(DISPLAY_TICKER_TO_REAL_TICKER).map(([displayTicker, realTicker]) => [realTicker, displayTicker])
 );
 
-const REAL_STOCK_TICKERS = new Set(Object.values(DISPLAY_TICKER_TO_REAL_TICKER));
+const REAL_STOCK_TICKERS = new Set(
+  [...TICKERS, ...Object.values(DISPLAY_TICKER_TO_REAL_TICKER)].map(ticker =>
+    String(ticker || "").toUpperCase().replace(/[^A-Z0-9.]/g, "")
+  )
+);
 
 function normalizeStockTicker(ticker) {
   return String(ticker || "").toUpperCase().replace(/[^A-Z0-9.]/g, "");
@@ -79,88 +98,24 @@ function isRealStockTicker(ticker) {
 }
 
 // ============================
-// Synthetic project stock quotes
+// Synthetic stock quotes are disabled
 // ============================
-// Unmapped fake/project stocks do not call Finnhub, Yahoo, or Twelve Data.
-// If a future fake stock is NOT mapped in DISPLAY_TICKER_TO_REAL_TICKER,
-// it gets a deterministic synthetic quote here with zero API usage.
-//
-// SKYX is intentionally NOT synthetic: it maps to real SpaceX market data under SPCX,
-// while the Roblox UI still displays the fake company name Sky Examination Corporation.
+// Every configured stock in this game is intended to use real market data.
+// Display names can be fake in Roblox, but stock prices/candles must come from real tickers.
+// If a real-data provider fails, the server returns an error or stale cache instead of inventing fake prices.
 const SYNTHETIC_STOCK_PROFILES = {};
 
-function syntheticHash(value) {
-  const str = String(value || "");
-  let hash = 2166136261;
-
-  for (let i = 0; i < str.length; i++) {
-    hash ^= str.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-
-  return hash >>> 0;
-}
-
-function syntheticUnit(value) {
-  return syntheticHash(value) / 0xffffffff;
-}
-
-function getSyntheticStockProfile(ticker) {
-  ticker = normalizeStockTicker(ticker);
-
-  if (SYNTHETIC_STOCK_PROFILES[ticker]) {
-    return SYNTHETIC_STOCK_PROFILES[ticker];
-  }
-
-  const hash = syntheticHash(ticker);
-  return {
-    name: ticker,
-    basePrice: 5 + (hash % 9500) / 100,
-    volatilityPct: 1.4 + ((hash % 160) / 100)
-  };
+function getSyntheticStockProfile() {
+  return null;
 }
 
 function applySyntheticStockQuote(ticker) {
-  ticker = normalizeStockTicker(ticker);
-  if (!ticker) return null;
-
-  const profile = getSyntheticStockProfile(ticker);
-  const now = Date.now();
-  const nowSec = Math.floor(now / 1000);
-  const dayBucket = Math.floor(now / 86400000);
-  const minuteBucket = Math.floor(now / 60000);
-  const base = Number(profile.basePrice) || 25;
-  const volatilityPct = Math.max(0.25, Number(profile.volatilityPct) || 1.5);
-
-  const dayDrift = (syntheticUnit(`${ticker}:day:${dayBucket}`) - 0.5) * volatilityPct * 1.2;
-  const minuteWave = Math.sin((minuteBucket + (syntheticHash(ticker) % 997)) * 0.071) * volatilityPct * 0.45;
-  const minuteNoise = (syntheticUnit(`${ticker}:minute:${minuteBucket}`) - 0.5) * volatilityPct * 0.35;
-  const changePctNumber = dayDrift + minuteWave + minuteNoise;
-
-  const prevClose = Math.max(0.01, base * (1 + ((syntheticUnit(`${ticker}:prev:${dayBucket}`) - 0.5) * volatilityPct * 0.01)));
-  const price = Math.max(0.01, prevClose * (1 + changePctNumber / 100));
-
-  priceCache[ticker] = {
-    price: Number(price.toFixed(price >= 1 ? 2 : 4)),
-    prevClose: Number(prevClose.toFixed(prevClose >= 1 ? 2 : 4)),
-    changePct: changePctNumber.toFixed(2),
-    source: "proxy synthetic project stock",
-    synthetic: true,
-    marketState: "SYNTHETIC",
-    companyName: profile.name,
-    lastUpdated: nowSec,
-    fetchedAt: now
-  };
-
-  return priceCache[ticker];
+  console.warn(`[STOCK] Synthetic quote blocked for ${ticker}. Add/use a real ticker mapping instead.`);
+  return null;
 }
 
 function applySyntheticProjectStockQuotes() {
-  for (const ticker of TICKERS) {
-    if (!isRealStockTicker(ticker)) {
-      applySyntheticStockQuote(ticker);
-    }
-  }
+  // No-op by design. Do not fabricate stock prices.
 }
 
 let wsReady = false;
@@ -405,10 +360,7 @@ async function seedPrevClose() {
 
   for (const ticker of TICKERS) {
     if (!isRealStockTicker(ticker)) {
-      const synthetic = applySyntheticStockQuote(ticker);
-      if (synthetic) {
-        console.log(`[SEED] ${ticker} synthetic = $${synthetic.price}`);
-      }
+      console.warn(`[SEED] ${ticker} skipped because it is not configured as a real-data stock.`);
       continue;
     }
 
@@ -526,8 +478,8 @@ let lastCreditReset = new Date().toDateString();
 const MAX_CREDITS_PER_DAY = Number(process.env.TWELVE_DATA_MAX_CREDITS_PER_DAY || 50);
 
 // Background Twelve Data quote polling is OFF by default; it was burning daily credits without players opening charts.
-// Stock candles use Yahoo Finance first. During regular market hours, Twelve Data is now ready as the backup
-// for real stock tickers only if Yahoo fails. Fake/project tickers still go straight to synthetic candles.
+// Stock candles use Yahoo Finance first. During regular market hours, Twelve Data is the backup
+// if Yahoo fails. Synthetic/fake stock candles are disabled; all stocks use real ticker data.
 // Set ENABLE_TWELVE_DATA_CANDLES=true if you want Twelve Data as a fallback outside regular market hours too.
 const ENABLE_TWELVE_DATA_POLLING = process.env.ENABLE_TWELVE_DATA_POLLING === "true";
 const ENABLE_TWELVE_DATA_CANDLES = process.env.ENABLE_TWELVE_DATA_CANDLES === "true";
@@ -1326,98 +1278,8 @@ async function fetchYahooStockCandles(ticker, interval, limit = 200) {
 }
 
 function generateSyntheticStockCandles(ticker, interval, limit = 200) {
-  ticker = String(ticker || "").toUpperCase();
-  interval = String(interval || "1min");
-
-  const seconds = STOCK_CANDLE_INTERVAL_SECONDS[interval];
-
-  if (!seconds) {
-    return {
-      error: "Unsupported stock candle interval."
-    };
-  }
-
-  const info = priceCache[ticker];
-  const currentPrice = info && toNumber(info.price || info.prevClose);
-
-  if (!currentPrice || currentPrice <= 0) {
-    return {
-      error: "No cached stock price available yet. Wait for prices to load, then try the chart again."
-    };
-  }
-
-  const prevCloseRaw = info && toNumber(info.prevClose);
-  const anchorPrice = prevCloseRaw && prevCloseRaw > 0 ? prevCloseRaw : currentPrice;
-  const stepMs = seconds * 1000;
-  const endMs = Math.floor(Date.now() / stepMs) * stepMs;
-  const profile = getSyntheticStockProfile(ticker);
-  const addedAtMs = Number(profile.addedAt) > 0 ? Number(profile.addedAt) * 1000 : null;
-  const firstAllowedMs = addedAtMs ? Math.ceil(addedAtMs / stepMs) * stepMs : null;
-
-  // New/private stocks should not appear to have months of old history.
-  // If a synthetic project stock has addedAt, clamp candle history to that launch time.
-  let candleCount = limit;
-  if (firstAllowedMs) {
-    candleCount = Math.floor((endMs - firstAllowedMs) / stepMs) + 1;
-    candleCount = Math.max(1, Math.min(limit, candleCount));
-  }
-
-  const hash = stableHashString(`${ticker}:${interval}`);
-  const candles = [];
-
-  let previousClose = anchorPrice;
-  const totalMove = currentPrice - anchorPrice;
-  const movePct = Math.abs(totalMove) / Math.max(anchorPrice, 0.000001);
-  const wigglePct = Math.max(0.0015, Math.min(0.018, 0.004 + movePct * 0.35));
-
-  for (let i = 0; i < candleCount; i++) {
-    const progress = candleCount <= 1 ? 1 : i / (candleCount - 1);
-    let tMs = endMs - ((candleCount - i - 1) * stepMs);
-    if (firstAllowedMs) tMs = Math.max(tMs, firstAllowedMs);
-
-    const drift = anchorPrice + (totalMove * progress);
-    const bucket = Math.floor(tMs / stepMs);
-    const timeHash = stableHashString(`${ticker}:${interval}:${bucket}`);
-    const wave = Math.sin((bucket + (hash % 97)) * 0.31) * anchorPrice * wigglePct;
-    const noise = (deterministicUnit(timeHash + i * 7919) - 0.5) * anchorPrice * wigglePct * 0.65;
-
-    let close = drift + wave + noise;
-    if (i === limit - 1) close = currentPrice;
-    if (!Number.isFinite(close) || close <= 0) close = Math.max(currentPrice * 0.01, 0.000001);
-
-    let open = i === 0
-      ? close * (1 + ((deterministicUnit(hash + 17) - 0.5) * wigglePct))
-      : previousClose;
-
-    if (!Number.isFinite(open) || open <= 0) open = close;
-
-    const body = Math.abs(close - open);
-    const minSpread = Math.max(currentPrice * 0.0008, 0.000001);
-    const spread = Math.max(body, minSpread);
-    const highExtra = spread * (0.35 + deterministicUnit(hash + i * 3571));
-    const lowExtra = spread * (0.35 + deterministicUnit(hash + i * 5501));
-
-    const high = Math.max(open, close) + highExtra;
-    const low = Math.max(0.000001, Math.min(open, close) - lowExtra);
-    const volume = Math.round(100000 + deterministicUnit(hash + i * 1013) * 900000);
-
-    candles.push({
-      t: formatSyntheticStockCandleTime(tMs, interval),
-      o: roundCandleNumber(open),
-      h: roundCandleNumber(high),
-      l: roundCandleNumber(low),
-      c: roundCandleNumber(close),
-      v: volume
-    });
-
-    previousClose = close;
-  }
-
   return {
-    candles,
-    source: "proxy synthetic stock candles",
-    addedAt: addedAtMs ? Math.floor(addedAtMs / 1000) : null,
-    launchLimited: Boolean(addedAtMs)
+    error: "Synthetic stock candles are disabled. This game uses real ticker data only."
   };
 }
 
@@ -2294,17 +2156,10 @@ app.get("/price", async (req, res) => {
   let data = priceCache[ticker];
 
   if (!isRealStockTicker(ticker)) {
-    data = applySyntheticStockQuote(ticker);
-    return res.json(
-      data
-        ? {
-            ticker,
-            ...data
-          }
-        : {
-            error: "No data"
-          }
-    );
+    return res.json({
+      ticker,
+      error: "Unknown stock ticker. Stock prices must come from real market data; synthetic fallback is disabled."
+    });
   }
 
   const ageMs = data && data.fetchedAt ? Date.now() - data.fetchedAt : Infinity;
@@ -2357,25 +2212,11 @@ app.get("/candles", async (req, res) => {
   const realStockTicker = isRealStockTicker(ticker);
 
   if (!realStockTicker) {
-    applySyntheticStockQuote(ticker);
-    const generated = generateSyntheticStockCandles(ticker, tdInterval, outputsize);
-
-    if (generated.error) {
-      return res.json({
-        error: generated.error
-      });
-    }
-
     return res.json({
       ticker,
       interval: tdInterval,
-      candles: generated.candles,
-      cached: false,
-      synthetic: true,
-      source: generated.source,
-      addedAt: generated.addedAt || null,
-      launchLimited: generated.launchLimited == true,
-      note: "Synthetic project stock candles use zero external API credits."
+      error: "Unknown stock ticker. Stock candles must come from real market data; synthetic fallback is disabled.",
+      synthetic: false
     });
   }
 
@@ -2410,68 +2251,34 @@ app.get("/candles", async (req, res) => {
       source: "Yahoo Finance"
     });
   } catch (yahooErr) {
-    // Fake/project tickers will not exist on Yahoo. They go straight to zero-credit synthetic candles.
-    // Real stocks use Twelve Data as a regular-market backup when Yahoo fails.
+    // Real stocks use Twelve Data as a backup when Yahoo fails. If the backup is disabled for
+    // this request/session, return unavailable instead of fabricating candles.
     if (!shouldUseTwelveDataCandleBackup(ticker)) {
-      const generated = generateSyntheticStockCandles(ticker, tdInterval, outputsize);
-
-      if (generated.error) {
-        return res.json({
-          error: generated.error,
-          providerError: yahooErr.message
-        });
-      }
-
       return res.json({
         ticker,
         interval: tdInterval,
-        candles: generated.candles,
-        cached: false,
-        synthetic: true,
-        source: generated.source,
+        error: "Yahoo did not return usable stock candles, and Twelve Data backup is disabled for this request/session.",
         providerError: yahooErr.message,
-        note: "Yahoo did not return usable stock candles. Twelve Data backup was skipped because this is a fake ticker, outside regular market hours, or disabled. Synthetic candles used zero Twelve Data credits."
+        synthetic: false
       });
     }
   }
 
   if (!TWELVE_DATA_API_KEY) {
-    const generated = generateSyntheticStockCandles(ticker, tdInterval, outputsize);
-
-    if (generated.error) {
-      return res.json({
-        error: "TWELVE_DATA_API_KEY is not set and synthetic fallback could not be generated: " + generated.error
-      });
-    }
-
     return res.json({
       ticker,
       interval: tdInterval,
-      candles: generated.candles,
-      cached: false,
-      synthetic: true,
-      source: generated.source,
-      providerError: "TWELVE_DATA_API_KEY is not set."
+      error: "Yahoo did not return usable stock candles, and TWELVE_DATA_API_KEY is not set for real-data backup.",
+      synthetic: false
     });
   }
 
   if (twelveDataCandleCreditsUsedToday >= MAX_TWELVE_DATA_CANDLE_CREDITS_PER_DAY) {
-    const generated = generateSyntheticStockCandles(ticker, tdInterval, outputsize);
-
-    if (!generated.error) {
-      return res.json({
-        ticker,
-        interval: tdInterval,
-        candles: generated.candles,
-        cached: false,
-        synthetic: true,
-        source: generated.source,
-        providerError: "Proxy Twelve Data candle cap reached for today."
-      });
-    }
-
     return res.json({
-      error: "Proxy Twelve Data candle cap reached for today."
+      ticker,
+      interval: tdInterval,
+      error: "Proxy Twelve Data candle cap reached for today. Real-data candle backup unavailable.",
+      synthetic: false
     });
   }
 
@@ -2487,22 +2294,11 @@ app.get("/candles", async (req, res) => {
     const data = await tdRequest(url, TD_PRIORITY.candle);
 
     if (data.status === "error" || !data.values) {
-      const generated = generateSyntheticStockCandles(ticker, tdInterval, outputsize);
-
-      if (!generated.error) {
-        return res.json({
-          ticker,
-          interval: tdInterval,
-          candles: generated.candles,
-          cached: false,
-          synthetic: true,
-          source: generated.source,
-          providerError: data.message || "No Twelve Data candle data"
-        });
-      }
-
       return res.json({
-        error: data.message || "No data"
+        ticker,
+        interval: tdInterval,
+        error: data.message || "No Twelve Data candle data",
+        synthetic: false
       });
     }
 
@@ -2528,22 +2324,11 @@ app.get("/candles", async (req, res) => {
       source: "Twelve Data"
     });
   } catch (e) {
-    const generated = generateSyntheticStockCandles(ticker, tdInterval, outputsize);
-
-    if (!generated.error) {
-      return res.json({
-        ticker,
-        interval: tdInterval,
-        candles: generated.candles,
-        cached: false,
-        synthetic: true,
-        source: generated.source,
-        providerError: e.message
-      });
-    }
-
     res.json({
-      error: e.message
+      ticker,
+      interval: tdInterval,
+      error: e.message,
+      synthetic: false
     });
   }
 });
