@@ -4,6 +4,8 @@ const WebSocket = require("ws");
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+app.use(express.json({ limit: "25kb" }));
+
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY;
 const FREECRYPTO_API_KEY = process.env.FREECRYPTO_API_KEY;
@@ -2009,6 +2011,299 @@ async function fetchCryptoCandles(symbol, interval) {
     error: lastError || "Crypto candle request failed."
   };
 }
+
+
+// ============================
+// Roblox group role sync
+// ============================
+// Roblox cannot safely hold your Open Cloud API key inside replicated client code.
+// This endpoint lets a Roblox SERVER script send the player's in-game role here,
+// then this Node backend updates the player's group role through Roblox Open Cloud.
+//
+// Required environment variables on your deployment host:
+// ROBLOX_OPEN_CLOUD_API_KEY = Open Cloud API key with group:write permission
+// GROUP_SYNC_SECRET = random shared secret; must match the Roblox ServerScript
+//
+// Optional:
+// ROBLOX_GROUP_ID = 15696460
+// GROUP_ROLE_INTERN_NAME = Intern
+// GROUP_ROLE_ROOKIE_NAME = Rookie Trader
+// GROUP_ROLE_INTERMEDIATE_NAME = Intermediate Trader
+// GROUP_ROLE_DAY_TRADER_NAME = Day Trader
+
+const ROBLOX_GROUP_ID = String(process.env.ROBLOX_GROUP_ID || "15696460");
+const ROBLOX_OPEN_CLOUD_API_KEY = process.env.ROBLOX_OPEN_CLOUD_API_KEY || "";
+const GROUP_SYNC_SECRET = process.env.GROUP_SYNC_SECRET || "";
+
+const GAME_ROLE_TO_GROUP_ROLE_NAME = {
+  "Intern": process.env.GROUP_ROLE_INTERN_NAME || "Intern",
+  "Rookie Trader": process.env.GROUP_ROLE_ROOKIE_NAME || "Rookie Trader",
+  "Intermediate Trader": process.env.GROUP_ROLE_INTERMEDIATE_NAME || "Intermediate Trader",
+  "Day Trader": process.env.GROUP_ROLE_DAY_TRADER_NAME || "Day Trader"
+};
+
+let cachedGroupRolesByDisplayName = null;
+let cachedGroupRolesFetchedAtMs = 0;
+const GROUP_ROLE_CACHE_TTL_MS = 10 * 60 * 1000;
+
+function normalizeGameRole(role) {
+  role = String(role || "").trim();
+  return Object.prototype.hasOwnProperty.call(GAME_ROLE_TO_GROUP_ROLE_NAME, role) ? role : "";
+}
+
+function getGroupRoleDisplayName(role) {
+  return String(role && (role.displayName || role.name || role.roleName || "") || "").trim();
+}
+
+function getGroupRoleResource(role) {
+  const path = String(role && (role.path || "") || "").trim();
+  if (/^groups\/\d+\/roles\/\d+$/.test(path)) {
+    return path;
+  }
+
+  const name = String(role && (role.name || "") || "").trim();
+  if (/^groups\/\d+\/roles\/\d+$/.test(name)) {
+    return name;
+  }
+
+  const id = String(role && (role.id || role.roleId || "") || "").trim();
+  if (/^\d+$/.test(id)) {
+    return `groups/${ROBLOX_GROUP_ID}/roles/${id}`;
+  }
+
+  return "";
+}
+
+function listRolesFromPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    return [];
+  }
+
+  if (Array.isArray(payload.groupRoles)) return payload.groupRoles;
+  if (Array.isArray(payload.roles)) return payload.roles;
+  if (Array.isArray(payload.data)) return payload.data;
+  return [];
+}
+
+async function robloxOpenCloudJson(url, options = {}) {
+  if (!ROBLOX_OPEN_CLOUD_API_KEY) {
+    throw new Error("ROBLOX_OPEN_CLOUD_API_KEY is not set.");
+  }
+
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      "x-api-key": ROBLOX_OPEN_CLOUD_API_KEY,
+      "accept": "application/json",
+      ...(options.body ? { "content-type": "application/json" } : {}),
+      ...(options.headers || {})
+    }
+  });
+
+  let data = null;
+  const text = await response.text();
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch (_) {
+      data = { raw: text };
+    }
+  }
+
+  if (!response.ok) {
+    const message =
+      data && (data.message || data.error || data.raw)
+        ? String(data.message || data.error || data.raw)
+        : `Roblox Open Cloud HTTP ${response.status}`;
+    const error = new Error(message);
+    error.status = response.status;
+    error.data = data;
+    throw error;
+  }
+
+  return data || {};
+}
+
+async function getGroupRolesByDisplayName(forceRefresh = false) {
+  const now = Date.now();
+
+  if (
+    !forceRefresh &&
+    cachedGroupRolesByDisplayName &&
+    now - cachedGroupRolesFetchedAtMs < GROUP_ROLE_CACHE_TTL_MS
+  ) {
+    return cachedGroupRolesByDisplayName;
+  }
+
+  const rolesByDisplayName = {};
+  let pageToken = "";
+
+  do {
+    const url =
+      `https://apis.roblox.com/cloud/v2/groups/${encodeURIComponent(ROBLOX_GROUP_ID)}/roles` +
+      `?maxPageSize=100` +
+      (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "");
+
+    const data = await robloxOpenCloudJson(url);
+    const roles = listRolesFromPayload(data);
+
+    for (const role of roles) {
+      const displayName = getGroupRoleDisplayName(role);
+      const resource = getGroupRoleResource(role);
+
+      if (displayName && resource) {
+        rolesByDisplayName[displayName] = {
+          displayName,
+          resource,
+          id: String(role.id || role.roleId || "").trim(),
+          rank: Number(role.rank || 0),
+          memberCount: Number(role.memberCount || 0)
+        };
+      }
+    }
+
+    pageToken = String(data.nextPageToken || "");
+  } while (pageToken);
+
+  cachedGroupRolesByDisplayName = rolesByDisplayName;
+  cachedGroupRolesFetchedAtMs = now;
+  return rolesByDisplayName;
+}
+
+async function updateRobloxGroupRole(userId, groupRoleResource) {
+  const url =
+    `https://apis.roblox.com/cloud/v2/groups/${encodeURIComponent(ROBLOX_GROUP_ID)}` +
+    `/memberships/${encodeURIComponent(String(userId))}`;
+
+  return robloxOpenCloudJson(url, {
+    method: "PATCH",
+    body: JSON.stringify({
+      role: groupRoleResource
+    })
+  });
+}
+
+function assertGroupSyncSecret(req) {
+  if (!GROUP_SYNC_SECRET) {
+    return false;
+  }
+
+  const headerSecret = String(req.get("x-gc-group-sync-secret") || "");
+  const bodySecret = String(req.body && req.body.secret || "");
+  return headerSecret === GROUP_SYNC_SECRET || bodySecret === GROUP_SYNC_SECRET;
+}
+
+app.get("/group-role/status", async (req, res) => {
+  if (!assertGroupSyncSecret(req)) {
+    return res.status(401).json({ ok: false, error: "Unauthorized." });
+  }
+
+  try {
+    const roles = await getGroupRolesByDisplayName(req.query.refresh === "1");
+    res.json({
+      ok: true,
+      groupId: ROBLOX_GROUP_ID,
+      openCloudKeyPresent: ROBLOX_OPEN_CLOUD_API_KEY.length > 0,
+      roleMap: GAME_ROLE_TO_GROUP_ROLE_NAME,
+      availableGroupRoles: Object.values(roles)
+    });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      error: e.message,
+      status: e.status || 500,
+      details: e.data || null
+    });
+  }
+});
+
+app.post("/group-role/sync", async (req, res) => {
+  if (!assertGroupSyncSecret(req)) {
+    return res.status(401).json({ ok: false, error: "Unauthorized." });
+  }
+
+  const userId = Number(req.body && req.body.userId);
+  const username = String(req.body && req.body.username || "");
+  const gameRole = normalizeGameRole(req.body && req.body.role);
+  const inGroup = req.body && req.body.inGroup === true;
+
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(400).json({ ok: false, error: "Invalid userId." });
+  }
+
+  if (!gameRole) {
+    return res.status(400).json({
+      ok: false,
+      error: "Invalid game role.",
+      allowedRoles: Object.keys(GAME_ROLE_TO_GROUP_ROLE_NAME)
+    });
+  }
+
+  if (!inGroup) {
+    return res.json({
+      ok: true,
+      skipped: true,
+      reason: "Player is not in group.",
+      userId,
+      username,
+      gameRole
+    });
+  }
+
+  try {
+    let roles = await getGroupRolesByDisplayName(false);
+    const desiredGroupRoleName = GAME_ROLE_TO_GROUP_ROLE_NAME[gameRole];
+    let desiredGroupRole = roles[desiredGroupRoleName];
+
+    // If a role was just renamed/created, refresh once before failing.
+    if (!desiredGroupRole) {
+      roles = await getGroupRolesByDisplayName(true);
+      desiredGroupRole = roles[desiredGroupRoleName];
+    }
+
+    if (!desiredGroupRole) {
+      return res.status(400).json({
+        ok: false,
+        error: `No group role named "${desiredGroupRoleName}" was found in group ${ROBLOX_GROUP_ID}.`,
+        gameRole,
+        wantedGroupRoleName: desiredGroupRoleName,
+        availableGroupRoles: Object.keys(roles)
+      });
+    }
+
+    const robloxResult = await updateRobloxGroupRole(userId, desiredGroupRole.resource);
+
+    console.log(
+      `[GROUP ROLE] ${username || userId} -> gameRole="${gameRole}" groupRole="${desiredGroupRole.displayName}" (${desiredGroupRole.resource})`
+    );
+
+    res.json({
+      ok: true,
+      userId,
+      username,
+      gameRole,
+      groupRole: desiredGroupRole.displayName,
+      groupRoleResource: desiredGroupRole.resource,
+      roblox: robloxResult
+    });
+  } catch (e) {
+    console.error("[GROUP ROLE] Sync failed", {
+      userId,
+      username,
+      gameRole,
+      error: e.message,
+      status: e.status || 500,
+      details: e.data || null
+    });
+
+    res.status(e.status || 500).json({
+      ok: false,
+      error: e.message,
+      status: e.status || 500,
+      details: e.data || null
+    });
+  }
+});
 
 // ============================
 // Routes
