@@ -26,6 +26,7 @@ const DISPLAY_TICKER_TO_REAL_TICKER = {
   ELPHT: "GOOGL",
   DATA: "META",
   NKLA: "TSLA",
+  SKYX: "SPCX",
   BKSG: "BRK.B",
   HCC: "AVGO",
   ELLY: "LLY",
@@ -80,16 +81,13 @@ function isRealStockTicker(ticker) {
 // ============================
 // Synthetic project stock quotes
 // ============================
-// Private/fake in-game stocks, such as SKYX, do not call Finnhub, Yahoo, or Twelve Data.
-// Add future fake stocks to TICKERS only; if they are not mapped in DISPLAY_TICKER_TO_REAL_TICKER,
-// they will get a deterministic synthetic quote here with zero API usage.
-const SYNTHETIC_STOCK_PROFILES = {
-  SKYX: {
-    name: "Sky Examination Corporation",
-    basePrice: 245.75,
-    volatilityPct: 2.8
-  }
-};
+// Unmapped fake/project stocks do not call Finnhub, Yahoo, or Twelve Data.
+// If a future fake stock is NOT mapped in DISPLAY_TICKER_TO_REAL_TICKER,
+// it gets a deterministic synthetic quote here with zero API usage.
+//
+// SKYX is intentionally NOT synthetic: it maps to real SpaceX market data under SPCX,
+// while the Roblox UI still displays the fake company name Sky Examination Corporation.
+const SYNTHETIC_STOCK_PROFILES = {};
 
 function syntheticHash(value) {
   const str = String(value || "");
@@ -1352,6 +1350,18 @@ function generateSyntheticStockCandles(ticker, interval, limit = 200) {
   const anchorPrice = prevCloseRaw && prevCloseRaw > 0 ? prevCloseRaw : currentPrice;
   const stepMs = seconds * 1000;
   const endMs = Math.floor(Date.now() / stepMs) * stepMs;
+  const profile = getSyntheticStockProfile(ticker);
+  const addedAtMs = Number(profile.addedAt) > 0 ? Number(profile.addedAt) * 1000 : null;
+  const firstAllowedMs = addedAtMs ? Math.ceil(addedAtMs / stepMs) * stepMs : null;
+
+  // New/private stocks should not appear to have months of old history.
+  // If a synthetic project stock has addedAt, clamp candle history to that launch time.
+  let candleCount = limit;
+  if (firstAllowedMs) {
+    candleCount = Math.floor((endMs - firstAllowedMs) / stepMs) + 1;
+    candleCount = Math.max(1, Math.min(limit, candleCount));
+  }
+
   const hash = stableHashString(`${ticker}:${interval}`);
   const candles = [];
 
@@ -1360,9 +1370,10 @@ function generateSyntheticStockCandles(ticker, interval, limit = 200) {
   const movePct = Math.abs(totalMove) / Math.max(anchorPrice, 0.000001);
   const wigglePct = Math.max(0.0015, Math.min(0.018, 0.004 + movePct * 0.35));
 
-  for (let i = 0; i < limit; i++) {
-    const progress = limit <= 1 ? 1 : i / (limit - 1);
-    const tMs = endMs - ((limit - i - 1) * stepMs);
+  for (let i = 0; i < candleCount; i++) {
+    const progress = candleCount <= 1 ? 1 : i / (candleCount - 1);
+    let tMs = endMs - ((candleCount - i - 1) * stepMs);
+    if (firstAllowedMs) tMs = Math.max(tMs, firstAllowedMs);
 
     const drift = anchorPrice + (totalMove * progress);
     const bucket = Math.floor(tMs / stepMs);
@@ -1404,7 +1415,9 @@ function generateSyntheticStockCandles(ticker, interval, limit = 200) {
 
   return {
     candles,
-    source: "proxy synthetic stock candles"
+    source: "proxy synthetic stock candles",
+    addedAt: addedAtMs ? Math.floor(addedAtMs / 1000) : null,
+    launchLimited: Boolean(addedAtMs)
   };
 }
 
@@ -2341,8 +2354,29 @@ app.get("/candles", async (req, res) => {
     });
   }
 
-  if (!isRealStockTicker(ticker)) {
+  const realStockTicker = isRealStockTicker(ticker);
+
+  if (!realStockTicker) {
     applySyntheticStockQuote(ticker);
+    const generated = generateSyntheticStockCandles(ticker, tdInterval, outputsize);
+
+    if (generated.error) {
+      return res.json({
+        error: generated.error
+      });
+    }
+
+    return res.json({
+      ticker,
+      interval: tdInterval,
+      candles: generated.candles,
+      cached: false,
+      synthetic: true,
+      source: generated.source,
+      addedAt: generated.addedAt || null,
+      launchLimited: generated.launchLimited == true,
+      note: "Synthetic project stock candles use zero external API credits."
+    });
   }
 
   const cached = getCachedCandles(ticker, tdInterval);
