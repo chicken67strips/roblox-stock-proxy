@@ -2026,7 +2026,7 @@ async function fetchCryptoCandles(symbol, interval) {
 //
 // Optional:
 // ROBLOX_GROUP_ID = 15696460
-// GROUP_ROLE_INTERN_NAME = Intern
+// GROUP_ROLE_INTERN_NAME = Intern Trader
 // GROUP_ROLE_ROOKIE_NAME = Rookie Trader
 // GROUP_ROLE_INTERMEDIATE_NAME = Intermediate Trader
 // GROUP_ROLE_DAY_TRADER_NAME = Day Trader
@@ -2036,7 +2036,7 @@ const ROBLOX_OPEN_CLOUD_API_KEY = process.env.ROBLOX_OPEN_CLOUD_API_KEY || "";
 const GROUP_SYNC_SECRET = process.env.GROUP_SYNC_SECRET || "";
 
 const GAME_ROLE_TO_GROUP_ROLE_NAME = {
-  "Intern": process.env.GROUP_ROLE_INTERN_NAME || "Intern",
+  "Intern Trader": process.env.GROUP_ROLE_INTERN_NAME || "Intern Trader",
   "Rookie Trader": process.env.GROUP_ROLE_ROOKIE_NAME || "Rookie Trader",
   "Intermediate Trader": process.env.GROUP_ROLE_INTERMEDIATE_NAME || "Intermediate Trader",
   "Day Trader": process.env.GROUP_ROLE_DAY_TRADER_NAME || "Day Trader"
