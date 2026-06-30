@@ -12,7 +12,7 @@ const FREECRYPTO_BASE_URL = "https://api.freecryptoapi.com/v1";
 const priceCache = {};
 
 const TICKERS = [
-  "ORNG", "MHRD", "MVDO", "AMZG", "ELPHT", "DATA", "NKLA", "BKSG", "HCC", "ELLY", "PMK", "M", "FMT", "DVS", "WXM",
+  "ORNG", "MHRD", "MVDO", "AMZG", "ELPHT", "DATA", "NKLA", "SKYX", "BKSG", "HCC", "ELLY", "PMK", "M", "FMT", "DVS", "WXM",
   "ABMD", "NFKS", "BUM", "DGBE", "REVL", "MNEY", "VKNEE", "BEAR", "NICY", "PPL", "INFO", "OVER", "WBAB", "SMNY", "BC",
   "CHHD", "VSS",
   "MASK", "MNTS", "DSY", "INHD", "CLDI", "AZI", "DXST", "WCT", "AIXI", "CODX", "GOVX", "CHAI", "CDLX", "DCX", "CLPR"
@@ -75,6 +75,94 @@ function getDisplayTicker(realTicker) {
 
 function isRealStockTicker(ticker) {
   return REAL_STOCK_TICKERS.has(getRealTicker(ticker));
+}
+
+// ============================
+// Synthetic project stock quotes
+// ============================
+// Private/fake in-game stocks, such as SKYX, do not call Finnhub, Yahoo, or Twelve Data.
+// Add future fake stocks to TICKERS only; if they are not mapped in DISPLAY_TICKER_TO_REAL_TICKER,
+// they will get a deterministic synthetic quote here with zero API usage.
+const SYNTHETIC_STOCK_PROFILES = {
+  SKYX: {
+    name: "Sky Examination Corporation",
+    basePrice: 245.75,
+    volatilityPct: 2.8
+  }
+};
+
+function syntheticHash(value) {
+  const str = String(value || "");
+  let hash = 2166136261;
+
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return hash >>> 0;
+}
+
+function syntheticUnit(value) {
+  return syntheticHash(value) / 0xffffffff;
+}
+
+function getSyntheticStockProfile(ticker) {
+  ticker = normalizeStockTicker(ticker);
+
+  if (SYNTHETIC_STOCK_PROFILES[ticker]) {
+    return SYNTHETIC_STOCK_PROFILES[ticker];
+  }
+
+  const hash = syntheticHash(ticker);
+  return {
+    name: ticker,
+    basePrice: 5 + (hash % 9500) / 100,
+    volatilityPct: 1.4 + ((hash % 160) / 100)
+  };
+}
+
+function applySyntheticStockQuote(ticker) {
+  ticker = normalizeStockTicker(ticker);
+  if (!ticker) return null;
+
+  const profile = getSyntheticStockProfile(ticker);
+  const now = Date.now();
+  const nowSec = Math.floor(now / 1000);
+  const dayBucket = Math.floor(now / 86400000);
+  const minuteBucket = Math.floor(now / 60000);
+  const base = Number(profile.basePrice) || 25;
+  const volatilityPct = Math.max(0.25, Number(profile.volatilityPct) || 1.5);
+
+  const dayDrift = (syntheticUnit(`${ticker}:day:${dayBucket}`) - 0.5) * volatilityPct * 1.2;
+  const minuteWave = Math.sin((minuteBucket + (syntheticHash(ticker) % 997)) * 0.071) * volatilityPct * 0.45;
+  const minuteNoise = (syntheticUnit(`${ticker}:minute:${minuteBucket}`) - 0.5) * volatilityPct * 0.35;
+  const changePctNumber = dayDrift + minuteWave + minuteNoise;
+
+  const prevClose = Math.max(0.01, base * (1 + ((syntheticUnit(`${ticker}:prev:${dayBucket}`) - 0.5) * volatilityPct * 0.01)));
+  const price = Math.max(0.01, prevClose * (1 + changePctNumber / 100));
+
+  priceCache[ticker] = {
+    price: Number(price.toFixed(price >= 1 ? 2 : 4)),
+    prevClose: Number(prevClose.toFixed(prevClose >= 1 ? 2 : 4)),
+    changePct: changePctNumber.toFixed(2),
+    source: "proxy synthetic project stock",
+    synthetic: true,
+    marketState: "SYNTHETIC",
+    companyName: profile.name,
+    lastUpdated: nowSec,
+    fetchedAt: now
+  };
+
+  return priceCache[ticker];
+}
+
+function applySyntheticProjectStockQuotes() {
+  for (const ticker of TICKERS) {
+    if (!isRealStockTicker(ticker)) {
+      applySyntheticStockQuote(ticker);
+    }
+  }
 }
 
 let wsReady = false;
@@ -318,6 +406,14 @@ async function seedPrevClose() {
   console.log("[SEED] Starting...");
 
   for (const ticker of TICKERS) {
+    if (!isRealStockTicker(ticker)) {
+      const synthetic = applySyntheticStockQuote(ticker);
+      if (synthetic) {
+        console.log(`[SEED] ${ticker} synthetic = $${synthetic.price}`);
+      }
+      continue;
+    }
+
     try {
       const realTicker = getRealTicker(ticker);
       const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${realTicker}&token=${FINNHUB_API_KEY}`);
@@ -659,9 +755,17 @@ function quoteCacheAgeMs(ticker) {
 async function fetchYahooQuotesDeduped(symbols) {
   if (!ENABLE_YAHOO_ON_DEMAND_QUOTES && !ENABLE_YAHOO_QUOTE_POLLING) return 0;
 
-  const requested = symbols
+  const normalized = symbols
     .map(symbol => String(symbol || "").toUpperCase())
     .filter(Boolean);
+
+  for (const ticker of normalized) {
+    if (!isRealStockTicker(ticker)) {
+      applySyntheticStockQuote(ticker);
+    }
+  }
+
+  const requested = normalized.filter(isRealStockTicker);
 
   if (requested.length === 0) return 0;
 
@@ -803,6 +907,8 @@ function connectFinnhub() {
     wsReady = true;
 
     TICKERS.forEach(ticker => {
+      if (!isRealStockTicker(ticker)) return;
+
       ws.send(JSON.stringify({
         type: "subscribe",
         symbol: getRealTicker(ticker)
@@ -848,7 +954,10 @@ function startFinnhubRestPolling() {
     if (!wsIsQuiet) return;
     if (!isRegularMarketHours()) return;
 
-    const ticker = TICKERS[finnhubTickerIndex % TICKERS.length];
+    const realTickerPool = TICKERS.filter(isRealStockTicker);
+    if (realTickerPool.length === 0) return;
+
+    const ticker = realTickerPool[finnhubTickerIndex % realTickerPool.length];
     const realTicker = getRealTicker(ticker);
     finnhubTickerIndex++;
 
@@ -2139,6 +2248,9 @@ app.get("/crypto/debug", async (req, res) => {
 
 app.get("/prices", async (req, res) => {
   const wantsFresh = req.query.fresh === "1" || req.query.fresh === "true";
+
+  applySyntheticProjectStockQuotes();
+
   const cacheEmpty = Object.keys(priceCache).length === 0;
   const cacheHasAllTickers = TICKERS.every(ticker => {
     const row = priceCache[ticker];
@@ -2157,6 +2269,8 @@ app.get("/prices", async (req, res) => {
     }
   }
 
+  applySyntheticProjectStockQuotes();
+
   res.json(priceCache);
 });
 
@@ -2165,6 +2279,21 @@ app.get("/price", async (req, res) => {
   const wantsFresh = req.query.fresh === "1" || req.query.fresh === "true";
 
   let data = priceCache[ticker];
+
+  if (!isRealStockTicker(ticker)) {
+    data = applySyntheticStockQuote(ticker);
+    return res.json(
+      data
+        ? {
+            ticker,
+            ...data
+          }
+        : {
+            error: "No data"
+          }
+    );
+  }
+
   const ageMs = data && data.fetchedAt ? Date.now() - data.fetchedAt : Infinity;
 
   if (ENABLE_YAHOO_ON_DEMAND_QUOTES) {
@@ -2210,6 +2339,10 @@ app.get("/candles", async (req, res) => {
     return res.json({
       error: "Missing ticker."
     });
+  }
+
+  if (!isRealStockTicker(ticker)) {
+    applySyntheticStockQuote(ticker);
   }
 
   const cached = getCachedCandles(ticker, tdInterval);
