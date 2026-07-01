@@ -571,6 +571,7 @@ const YAHOO_QUOTE_BATCH_SIZE = Number(process.env.YAHOO_QUOTE_BATCH_SIZE || 10);
 const YAHOO_QUOTE_POLL_MS = Number(process.env.YAHOO_QUOTE_POLL_MS || 2500);
 const PRICE_CACHE_TTL_MS = Number(process.env.PRICE_CACHE_TTL_MS || 15000);
 const PRICE_CACHE_MAX_STALE_MS = Number(process.env.PRICE_CACHE_MAX_STALE_MS || 2 * 60 * 1000);
+const YAHOO_MISSING_PRICE_FALLBACK_LIMIT = Number(process.env.YAHOO_MISSING_PRICE_FALLBACK_LIMIT || 12);
 
 let yahooQuoteBatchIndex = 0;
 let allYahooQuotesFetchedAtMs = 0;
@@ -689,6 +690,121 @@ async function fetchYahooQuotes(symbols) {
   return updated;
 }
 
+async function fetchYahooChartQuoteFallback(ticker) {
+  ticker = String(ticker || "").toUpperCase();
+  if (!ticker || !isRealStockTicker(ticker)) return false;
+
+  const yahooSymbol = yahooTickerSymbol(ticker);
+  const url =
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}` +
+    `?range=5d&interval=1d&includePrePost=false`;
+
+  const resp = await fetchJsonWithTimeout(
+    url,
+    {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "Mozilla/5.0"
+      }
+    },
+    12000
+  );
+
+  if (!resp.ok) {
+    throw new Error(resp.data?.chart?.error?.description || `Yahoo chart quote HTTP ${resp.status}`);
+  }
+
+  const chart = resp.data && resp.data.chart;
+  const result = chart && Array.isArray(chart.result) && chart.result[0];
+  if (!result) {
+    throw new Error(chart?.error?.description || "No Yahoo chart quote result returned.");
+  }
+
+  const meta = result.meta || {};
+  const timestamps = Array.isArray(result.timestamp) ? result.timestamp : [];
+  const quote = result.indicators && result.indicators.quote && result.indicators.quote[0];
+  const closes = quote && Array.isArray(quote.close) ? quote.close : [];
+
+  let price =
+    toNumber(meta.regularMarketPrice) ||
+    toNumber(meta.postMarketPrice) ||
+    toNumber(meta.preMarketPrice);
+
+  if (!price || price <= 0) {
+    for (let i = closes.length - 1; i >= 0; i--) {
+      const close = toNumber(closes[i]);
+      if (close && close > 0) {
+        price = close;
+        break;
+      }
+    }
+  }
+
+  if (!price || price <= 0) {
+    price = toNumber(meta.previousClose);
+  }
+
+  if (!price || price <= 0) {
+    throw new Error("Yahoo chart quote returned no usable price.");
+  }
+
+  const existing = priceCache[ticker];
+  const prevClose =
+    toNumber(meta.previousClose) ||
+    (existing && toNumber(existing.prevClose)) ||
+    price;
+
+  const changePct = prevClose
+    ? (((price - prevClose) / prevClose) * 100).toFixed(2)
+    : "0.00";
+
+  const lastTimestamp = timestamps.length > 0 ? Number(timestamps[timestamps.length - 1]) : 0;
+
+  priceCache[ticker] = {
+    price,
+    prevClose,
+    changePct,
+    source: "Yahoo Finance chart fallback",
+    marketState: meta.marketState || "UNKNOWN",
+    lastUpdated:
+      toNumber(meta.regularMarketTime) ||
+      toNumber(meta.postMarketTime) ||
+      toNumber(meta.preMarketTime) ||
+      lastTimestamp ||
+      Math.floor(Date.now() / 1000),
+    fetchedAt: Date.now()
+  };
+
+  return true;
+}
+
+async function fillMissingYahooPricesWithChartFallback(limit = YAHOO_MISSING_PRICE_FALLBACK_LIMIT) {
+  if (!ENABLE_YAHOO_ON_DEMAND_QUOTES && !ENABLE_YAHOO_QUOTE_POLLING) return 0;
+
+  const missing = TICKERS.filter(ticker => {
+    const row = priceCache[ticker];
+    return isRealStockTicker(ticker) && (!row || !Number(row.price) || Number(row.price) <= 0);
+  }).slice(0, Math.max(0, Number(limit) || 0));
+
+  let updated = 0;
+
+  for (const ticker of missing) {
+    try {
+      if (await fetchYahooChartQuoteFallback(ticker)) {
+        updated++;
+      }
+    } catch (e) {
+      console.warn(`[YAHOO] Chart quote fallback failed for ${ticker}: ${e.message}`);
+    }
+  }
+
+  if (updated > 0) {
+    console.log(`[YAHOO] Chart quote fallback filled ${updated}/${missing.length} missing stock prices`);
+  }
+
+  return updated;
+}
+
 
 function yahooQuoteRequestKey(symbols) {
   return symbols
@@ -745,6 +861,8 @@ async function refreshAllYahooQuotes() {
     const batch = TICKERS.slice(i, i + YAHOO_QUOTE_BATCH_SIZE);
     updated += await fetchYahooQuotesDeduped(batch);
   }
+
+  updated += await fillMissingYahooPricesWithChartFallback();
 
   allYahooQuotesFetchedAtMs = Date.now();
   return updated;
@@ -2465,6 +2583,15 @@ app.get("/price", async (req, res) => {
         await fetchYahooQuotesDeduped([ticker]);
         data = priceCache[ticker];
       } catch (_) {}
+
+      if (!data || !Number(data.price) || Number(data.price) <= 0) {
+        try {
+          await fetchYahooChartQuoteFallback(ticker);
+          data = priceCache[ticker];
+        } catch (e) {
+          console.warn(`[YAHOO] /price fallback failed for ${ticker}: ${e.message}`);
+        }
+      }
     } else if (ageMs > PRICE_CACHE_TTL_MS) {
       triggerYahooQuoteRefresh([ticker]);
     }
