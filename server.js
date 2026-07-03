@@ -2751,6 +2751,63 @@ function membershipHasRole(membership, groupRoleResource) {
   });
 }
 
+function membershipBelongsToGroup(membership, groupId) {
+  const wanted = String(groupId || "");
+  const resource = getMembershipResource(membership);
+  if (resource.startsWith(`groups/${wanted}/memberships/`)) return true;
+
+  const groupValue = membership && (
+    membership.group ||
+    membership.groupPath ||
+    membership.groupName ||
+    (membership.group && (membership.group.path || membership.group.name || membership.group.id))
+  );
+
+  const groupText = String(groupValue || "");
+  if (groupText === `groups/${wanted}`) return true;
+  if (groupText === wanted) return true;
+  if (groupText.includes(`groups/${wanted}`)) return true;
+
+  return false;
+}
+
+function getNextPageToken(payload) {
+  return String(
+    (payload && (payload.nextPageToken || payload.next_page_token || payload.nextCursor || payload.cursor)) ||
+    ""
+  );
+}
+
+async function scanGroupMembershipsForUser(userId, maxPages = 25) {
+  const wantedUserId = Number(userId);
+  let pageToken = "";
+  let pagesRead = 0;
+
+  do {
+    const url =
+      `https://apis.roblox.com/cloud/v2/groups/${encodeURIComponent(ROBLOX_GROUP_ID)}/memberships` +
+      `?maxPageSize=100` +
+      (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "");
+
+    const data = await robloxOpenCloudJson(url);
+    const memberships = listMembershipsFromPayload(data);
+    const exact = memberships.find(membership => getMembershipUserId(membership) === wantedUserId);
+
+    if (exact) {
+      const resource = getMembershipResource(exact);
+      if (!resource) {
+        throw new Error("Group membership was found by scan, but no membership resource/path was returned.");
+      }
+      return { membership: exact, resource, lookupMethod: "groupScan" };
+    }
+
+    pageToken = getNextPageToken(data);
+    pagesRead += 1;
+  } while (pageToken && pagesRead < maxPages);
+
+  return null;
+}
+
 async function getGroupMembershipForUser(userId) {
   const wantedUserId = Number(userId);
   if (!Number.isInteger(wantedUserId) || wantedUserId <= 0) {
@@ -2758,34 +2815,44 @@ async function getGroupMembershipForUser(userId) {
   }
 
   const filtersToTry = [
+    `user == "users/${wantedUserId}"`,
     `user == 'users/${wantedUserId}'`,
     `user=='users/${wantedUserId}'`,
+    `users in ["users/${wantedUserId}"]`,
+    `users in ['users/${wantedUserId}']`,
+    `user in ["users/${wantedUserId}"]`,
+    `user in ['users/${wantedUserId}']`,
   ];
 
   const pathsToTry = [];
 
   for (const filter of filtersToTry) {
-    pathsToTry.push(
-      `https://apis.roblox.com/cloud/v2/groups/${encodeURIComponent(ROBLOX_GROUP_ID)}/memberships` +
-      `?maxPageSize=10&filter=${encodeURIComponent(filter)}`
-    );
+    pathsToTry.push({
+      method: `groups/${ROBLOX_GROUP_ID}/memberships filter ${filter}`,
+      url:
+        `https://apis.roblox.com/cloud/v2/groups/${encodeURIComponent(ROBLOX_GROUP_ID)}/memberships` +
+        `?maxPageSize=25&filter=${encodeURIComponent(filter)}`
+    });
+
+    pathsToTry.push({
+      method: `groups/-/memberships filter ${filter}`,
+      url:
+        `https://apis.roblox.com/cloud/v2/groups/-/memberships` +
+        `?maxPageSize=25&filter=${encodeURIComponent(filter)}`
+    });
   }
 
-  // Wildcard path is useful if Roblox's grouped filter path is temporarily weird.
-  pathsToTry.push(
-    `https://apis.roblox.com/cloud/v2/groups/-/memberships` +
-    `?maxPageSize=10&filter=${encodeURIComponent(`user == 'users/${wantedUserId}'`)}`
-  );
+  const errors = [];
 
-  let lastError = null;
-
-  for (const url of pathsToTry) {
+  for (const attempt of pathsToTry) {
     try {
-      const data = await robloxOpenCloudJson(url);
+      const data = await robloxOpenCloudJson(attempt.url);
       const memberships = listMembershipsFromPayload(data);
 
-      const exact = memberships.find(membership => getMembershipUserId(membership) === wantedUserId);
-      const candidate = exact || memberships[0];
+      const exact = memberships.find(membership =>
+        getMembershipUserId(membership) === wantedUserId && membershipBelongsToGroup(membership, ROBLOX_GROUP_ID)
+      );
+      const candidate = exact || memberships.find(membership => getMembershipUserId(membership) === wantedUserId);
 
       if (!candidate) {
         continue;
@@ -2794,22 +2861,30 @@ async function getGroupMembershipForUser(userId) {
       const resource = getMembershipResource(candidate);
 
       if (!resource) {
-        lastError = new Error("Group membership was found, but no membership resource/path was returned.");
+        errors.push(`${attempt.method}: membership found but no resource/path returned`);
         continue;
       }
 
       return {
         membership: candidate,
-        resource
+        resource,
+        lookupMethod: attempt.method
       };
     } catch (err) {
-      lastError = err;
+      errors.push(`${attempt.method}: ${err.status || "?"} ${err.message}`);
     }
   }
 
-  const err = new Error(lastError ? lastError.message : `No group membership found for user ${wantedUserId}.`);
-  err.status = lastError && lastError.status;
-  err.data = lastError && lastError.data;
+  try {
+    const scanned = await scanGroupMembershipsForUser(wantedUserId);
+    if (scanned) return scanned;
+  } catch (err) {
+    errors.push(`groupScan: ${err.status || "?"} ${err.message}`);
+  }
+
+  const err = new Error(`No group membership found for user ${wantedUserId}. Lookup attempts: ${errors.slice(-8).join(" | ")}`);
+  err.status = 404;
+  err.data = { lookupErrors: errors.slice(-20) };
   throw err;
 }
 
@@ -2910,12 +2985,13 @@ async function getGroupRolesByDisplayName(forceRefresh = false) {
 }
 
 async function updateRobloxGroupRole(userId, groupRoleResource) {
-  const { membership, resource: membershipResource } = await getGroupMembershipForUser(userId);
+  const { membership, resource: membershipResource, lookupMethod } = await getGroupMembershipForUser(userId);
 
   if (membershipHasRole(membership, groupRoleResource)) {
     return {
       alreadyAssigned: true,
       membershipResource,
+      lookupMethod,
       membership
     };
   }
@@ -2932,6 +3008,7 @@ async function updateRobloxGroupRole(userId, groupRoleResource) {
 
     return {
       membershipResource,
+      lookupMethod,
       method: "assignRole",
       result: assignResult
     };
@@ -2951,6 +3028,7 @@ async function updateRobloxGroupRole(userId, groupRoleResource) {
 
       return {
         membershipResource,
+        lookupMethod,
         method: "patchRole",
         assignRoleError: {
           status: assignErr.status || null,
@@ -3113,6 +3191,7 @@ app.post("/group-role/sync", async (req, res) => {
       groupRole: desiredGroupRole.displayName,
       groupRoleResource: desiredGroupRole.resource,
       membershipResource: robloxResult && robloxResult.membershipResource,
+      lookupMethod: robloxResult && robloxResult.lookupMethod,
       syncMethod: robloxResult && (robloxResult.method || (robloxResult.alreadyAssigned && "alreadyAssigned")),
       roblox: robloxResult
     });
