@@ -631,12 +631,177 @@ function positiveNumberOrNull(value) {
   return n !== null && n > 0 ? n : null;
 }
 
-function firstPositiveNumber(...values) {
+function firstDefinedYahooNumber(...values) {
   for (const value of values) {
-    const n = positiveNumberOrNull(value);
-    if (n !== null) return n;
+    const n = yahooRawNumber(value);
+    if (n !== null && n > 0) return n;
   }
   return null;
+}
+
+function yahooRawNumber(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Number(value.replace(/,/g, ""));
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  if (typeof value === "object") {
+    if (typeof value.raw === "number" && Number.isFinite(value.raw)) return value.raw;
+    if (typeof value.fmt === "string") {
+      const parsed = Number(value.fmt.replace(/,/g, ""));
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+    if (typeof value.longFmt === "string") {
+      const parsed = Number(value.longFmt.replace(/,/g, ""));
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+  }
+  return null;
+}
+
+const yahooFloatMetadataCache = {};
+const YAHOO_FLOAT_METADATA_TTL_MS = Number(process.env.YAHOO_FLOAT_METADATA_TTL_MS || 6 * 60 * 60 * 1000);
+const YAHOO_FLOAT_METADATA_CONCURRENCY = Math.max(1, Math.min(8, Number(process.env.YAHOO_FLOAT_METADATA_CONCURRENCY || 5)));
+
+function getCachedFloatMetadata(displayTicker) {
+  const ticker = String(displayTicker || "").toUpperCase();
+  const cached = yahooFloatMetadataCache[ticker];
+  if (!cached || !cached.fetchedAt) return null;
+  if (Date.now() - cached.fetchedAt > YAHOO_FLOAT_METADATA_TTL_MS) return null;
+  return cached;
+}
+
+function applyFloatMetadataToPriceCache(displayTicker, metadata) {
+  const ticker = String(displayTicker || "").toUpperCase();
+  if (!ticker || !metadata) return false;
+
+  const existing = priceCache[ticker] || {};
+  const floatShares = firstPositiveNumber(
+    metadata.floatShares,
+    metadata.publicFloat,
+    metadata.sharesOutstanding,
+    existing.floatShares,
+    existing.publicFloat
+  );
+  const sharesOutstanding = firstPositiveNumber(
+    metadata.sharesOutstanding,
+    existing.sharesOutstanding,
+    floatShares
+  );
+  const publicFloat = firstPositiveNumber(
+    metadata.publicFloat,
+    metadata.floatShares,
+    floatShares,
+    existing.publicFloat
+  );
+  const marketCap = firstPositiveNumber(metadata.marketCap, existing.marketCap);
+
+  yahooFloatMetadataCache[ticker] = {
+    marketCap,
+    sharesOutstanding,
+    floatShares,
+    publicFloat,
+    fetchedAt: Date.now()
+  };
+
+  if (priceCache[ticker]) {
+    priceCache[ticker] = {
+      ...existing,
+      marketCap,
+      sharesOutstanding,
+      floatShares,
+      publicFloat
+    };
+  }
+
+  return Boolean(floatShares || sharesOutstanding || marketCap);
+}
+
+async function fetchYahooFloatMetadata(displayTicker) {
+  const ticker = String(displayTicker || "").toUpperCase();
+  if (!ticker || !isRealStockTicker(ticker)) return false;
+
+  const cached = getCachedFloatMetadata(ticker);
+  if (cached) {
+    applyFloatMetadataToPriceCache(ticker, cached);
+    return true;
+  }
+
+  const yahooSymbol = yahooTickerSymbol(getRealTicker(ticker));
+  const url =
+    `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(yahooSymbol)}` +
+    `?modules=defaultKeyStatistics,price`;
+
+  const resp = await fetchJsonWithTimeout(
+    url,
+    {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "Mozilla/5.0"
+      }
+    },
+    9000
+  );
+
+  if (!resp.ok) {
+    throw new Error(resp.data?.quoteSummary?.error?.description || `Yahoo quoteSummary HTTP ${resp.status}`);
+  }
+
+  const result = resp.data?.quoteSummary?.result?.[0];
+  if (!result) {
+    throw new Error(resp.data?.quoteSummary?.error?.description || "Yahoo quoteSummary returned no result");
+  }
+
+  const stats = result.defaultKeyStatistics || {};
+  const price = result.price || {};
+
+  const metadata = {
+    marketCap: firstDefinedYahooNumber(price.marketCap, stats.marketCap),
+    sharesOutstanding: firstDefinedYahooNumber(price.sharesOutstanding, stats.sharesOutstanding),
+    floatShares: firstDefinedYahooNumber(stats.floatShares, price.floatShares),
+  };
+  metadata.publicFloat = firstPositiveNumber(metadata.floatShares, metadata.sharesOutstanding);
+
+  return applyFloatMetadataToPriceCache(ticker, metadata);
+}
+
+async function enrichYahooFloatMetadataForTickers(tickers) {
+  const unique = [...new Set(
+    (tickers || [])
+      .map(ticker => String(ticker || "").toUpperCase())
+      .filter(ticker => ticker && isRealStockTicker(ticker))
+  )];
+
+  const stale = unique.filter(ticker => !getCachedFloatMetadata(ticker));
+  if (stale.length === 0) {
+    unique.forEach(ticker => {
+      const cached = getCachedFloatMetadata(ticker);
+      if (cached) applyFloatMetadataToPriceCache(ticker, cached);
+    });
+    return 0;
+  }
+
+  let enriched = 0;
+
+  for (let i = 0; i < stale.length; i += YAHOO_FLOAT_METADATA_CONCURRENCY) {
+    const batch = stale.slice(i, i + YAHOO_FLOAT_METADATA_CONCURRENCY);
+    const results = await Promise.allSettled(batch.map(ticker => fetchYahooFloatMetadata(ticker)));
+
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled" && result.value) {
+        enriched++;
+      } else if (result.status === "rejected") {
+        console.warn(`[YAHOO FLOAT] ${batch[index]} unavailable: ${result.reason?.message || result.reason}`);
+      }
+    });
+  }
+
+  if (enriched > 0) {
+    console.log(`[YAHOO FLOAT] Enriched ${enriched}/${stale.length} stock floats`);
+  }
+
+  return enriched;
 }
 
 function applyYahooQuoteToCache(requestedTicker, row) {
@@ -685,9 +850,25 @@ async function fetchYahooQuotes(symbols) {
   if (requested.length === 0) return 0;
 
   const yahooSymbols = requested.map(yahooTickerSymbol);
+  const quoteFields = [
+    "symbol",
+    "regularMarketPrice",
+    "regularMarketPreviousClose",
+    "regularMarketTime",
+    "preMarketPrice",
+    "preMarketTime",
+    "postMarketPrice",
+    "postMarketTime",
+    "marketState",
+    "marketCap",
+    "sharesOutstanding",
+    "floatShares"
+  ].join(",");
+
   const url =
     `https://query1.finance.yahoo.com/v7/finance/quote` +
-    `?symbols=${encodeURIComponent(yahooSymbols.join(","))}`;
+    `?symbols=${encodeURIComponent(yahooSymbols.join(","))}` +
+    `&fields=${encodeURIComponent(quoteFields)}`;
 
   const resp = await fetchJsonWithTimeout(
     url,
@@ -717,6 +898,10 @@ async function fetchYahooQuotes(symbols) {
   requested.forEach((ticker, i) => {
     const row = byYahooSymbol.get(yahooSymbols[i].toUpperCase());
     if (row && applyYahooQuoteToCache(ticker, row)) updated++;
+  });
+
+  await enrichYahooFloatMetadataForTickers(requested).catch(err => {
+    console.warn(`[YAHOO FLOAT] Batch enrichment failed: ${err.message}`);
   });
 
   return updated;
@@ -810,6 +995,10 @@ async function fetchYahooChartQuoteFallback(ticker) {
     floatShares: existing && existing.floatShares,
     publicFloat: existing && existing.publicFloat
   };
+
+  await enrichYahooFloatMetadataForTickers([ticker]).catch(err => {
+    console.warn(`[YAHOO FLOAT] Chart fallback metadata failed for ${ticker}: ${err.message}`);
+  });
 
   return true;
 }
