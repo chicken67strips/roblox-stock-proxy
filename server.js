@@ -677,15 +677,20 @@ function applyFloatMetadataToPriceCache(displayTicker, metadata) {
   if (!ticker || !metadata) return false;
 
   const existing = priceCache[ticker] || {};
+  const derivedSharesFromMarketCap =
+    metadata.marketCap && existing.price ? Number(metadata.marketCap) / Number(existing.price) : null;
+
   const floatShares = firstPositiveNumber(
     metadata.floatShares,
     metadata.publicFloat,
     metadata.sharesOutstanding,
+    derivedSharesFromMarketCap,
     existing.floatShares,
     existing.publicFloat
   );
   const sharesOutstanding = firstPositiveNumber(
     metadata.sharesOutstanding,
+    derivedSharesFromMarketCap,
     existing.sharesOutstanding,
     floatShares
   );
@@ -718,20 +723,26 @@ function applyFloatMetadataToPriceCache(displayTicker, metadata) {
   return Boolean(floatShares || sharesOutstanding || marketCap);
 }
 
-async function fetchYahooFloatMetadata(displayTicker) {
+function normalizeFinnhubShareCount(value) {
+  const n = firstDefinedYahooNumber(value);
+  if (!n || n <= 0) return null;
+
+  // Finnhub stock/metric shareOutstanding and marketCapitalization are commonly returned in millions.
+  // If a provider returns a full raw share count instead, keep it as-is.
+  if (n < 1000000) return n * 1000000;
+  return n;
+}
+
+async function fetchFinnhubShareMetadata(displayTicker) {
   const ticker = String(displayTicker || "").toUpperCase();
-  if (!ticker || !isRealStockTicker(ticker)) return false;
+  if (!ticker || !isRealStockTicker(ticker) || !FINNHUB_API_KEY) return false;
 
-  const cached = getCachedFloatMetadata(ticker);
-  if (cached) {
-    applyFloatMetadataToPriceCache(ticker, cached);
-    return true;
-  }
-
-  const yahooSymbol = yahooTickerSymbol(getRealTicker(ticker));
+  const realTicker = getRealTicker(ticker);
   const url =
-    `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(yahooSymbol)}` +
-    `?modules=defaultKeyStatistics,price`;
+    `https://finnhub.io/api/v1/stock/metric` +
+    `?symbol=${encodeURIComponent(realTicker)}` +
+    `&metric=all` +
+    `&token=${encodeURIComponent(FINNHUB_API_KEY)}`;
 
   const resp = await fetchJsonWithTimeout(
     url,
@@ -745,25 +756,88 @@ async function fetchYahooFloatMetadata(displayTicker) {
   );
 
   if (!resp.ok) {
-    throw new Error(resp.data?.quoteSummary?.error?.description || `Yahoo quoteSummary HTTP ${resp.status}`);
+    throw new Error(resp.data?.error || `Finnhub metric HTTP ${resp.status}`);
   }
 
-  const result = resp.data?.quoteSummary?.result?.[0];
-  if (!result) {
-    throw new Error(resp.data?.quoteSummary?.error?.description || "Yahoo quoteSummary returned no result");
+  const metric = resp.data && resp.data.metric;
+  if (!metric || typeof metric !== "object") {
+    throw new Error("Finnhub metric returned no metric object");
   }
 
-  const stats = result.defaultKeyStatistics || {};
-  const price = result.price || {};
+  const sharesOutstanding = normalizeFinnhubShareCount(metric.shareOutstanding);
+  const possibleFloat = normalizeFinnhubShareCount(
+    metric.floatShares || metric.shareFloat || metric.freeFloat || metric.publicFloat
+  );
+  const marketCapMillions = firstDefinedYahooNumber(metric.marketCapitalization);
+  const marketCap = marketCapMillions && marketCapMillions > 0
+    ? marketCapMillions * 1000000
+    : null;
 
   const metadata = {
-    marketCap: firstDefinedYahooNumber(price.marketCap, stats.marketCap),
-    sharesOutstanding: firstDefinedYahooNumber(price.sharesOutstanding, stats.sharesOutstanding),
-    floatShares: firstDefinedYahooNumber(stats.floatShares, price.floatShares),
+    marketCap,
+    sharesOutstanding,
+    floatShares: possibleFloat || sharesOutstanding,
+    publicFloat: possibleFloat || sharesOutstanding
   };
-  metadata.publicFloat = firstPositiveNumber(metadata.floatShares, metadata.sharesOutstanding);
 
   return applyFloatMetadataToPriceCache(ticker, metadata);
+}
+
+async function fetchYahooFloatMetadata(displayTicker) {
+  const ticker = String(displayTicker || "").toUpperCase();
+  if (!ticker || !isRealStockTicker(ticker)) return false;
+
+  const cached = getCachedFloatMetadata(ticker);
+  if (cached) {
+    applyFloatMetadataToPriceCache(ticker, cached);
+    return true;
+  }
+
+  const yahooSymbol = yahooTickerSymbol(getRealTicker(ticker));
+
+  try {
+    const url =
+      `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(yahooSymbol)}` +
+      `?modules=defaultKeyStatistics,price`;
+
+    const resp = await fetchJsonWithTimeout(
+      url,
+      {
+        headers: {
+          Accept: "application/json",
+          "User-Agent": "Mozilla/5.0"
+        }
+      },
+      9000
+    );
+
+    if (!resp.ok) {
+      throw new Error(resp.data?.quoteSummary?.error?.description || `Yahoo quoteSummary HTTP ${resp.status}`);
+    }
+
+    const result = resp.data?.quoteSummary?.result?.[0];
+    if (!result) {
+      throw new Error(resp.data?.quoteSummary?.error?.description || "Yahoo quoteSummary returned no result");
+    }
+
+    const stats = result.defaultKeyStatistics || {};
+    const price = result.price || {};
+
+    const metadata = {
+      marketCap: firstDefinedYahooNumber(price.marketCap, stats.marketCap),
+      sharesOutstanding: firstDefinedYahooNumber(price.sharesOutstanding, stats.sharesOutstanding),
+      floatShares: firstDefinedYahooNumber(stats.floatShares, price.floatShares),
+    };
+    metadata.publicFloat = firstPositiveNumber(metadata.floatShares, metadata.sharesOutstanding);
+
+    if (applyFloatMetadataToPriceCache(ticker, metadata)) {
+      return true;
+    }
+  } catch (err) {
+    console.warn(`[YAHOO FLOAT] quoteSummary failed for ${ticker}: ${err.message}`);
+  }
+
+  return fetchFinnhubShareMetadata(ticker);
 }
 
 async function enrichYahooFloatMetadataForTickers(tickers) {
@@ -821,9 +895,10 @@ function applyYahooQuoteToCache(requestedTicker, row) {
     : "0.00";
 
   const marketCap = firstPositiveNumber(row.marketCap, existing && existing.marketCap);
-  const sharesOutstanding = firstPositiveNumber(row.sharesOutstanding, existing && existing.sharesOutstanding);
-  const floatShares = firstPositiveNumber(row.floatShares, row.sharesFloat, row.freeFloat, row.sharesOutstanding, existing && existing.floatShares);
-  const publicFloat = firstPositiveNumber(floatShares, existing && existing.publicFloat);
+  const derivedSharesFromMarketCap = marketCap && selected.price ? marketCap / selected.price : null;
+  const sharesOutstanding = firstPositiveNumber(row.sharesOutstanding, derivedSharesFromMarketCap, existing && existing.sharesOutstanding);
+  const floatShares = firstPositiveNumber(row.floatShares, row.sharesFloat, row.freeFloat, row.sharesOutstanding, derivedSharesFromMarketCap, existing && existing.floatShares);
+  const publicFloat = firstPositiveNumber(floatShares, sharesOutstanding, existing && existing.publicFloat);
 
   priceCache[ticker] = {
     price: selected.price,
