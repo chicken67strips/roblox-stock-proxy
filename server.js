@@ -372,10 +372,15 @@ async function seedPrevClose() {
       const data = await res.json();
 
       if (data.c || data.pc) {
+        const existing = priceCache[ticker] || {};
         priceCache[ticker] = {
           price: data.c || data.pc,
           prevClose: data.pc || data.c,
-          changePct: data.dp ? data.dp.toFixed(2) : "0.00"
+          changePct: data.dp ? data.dp.toFixed(2) : "0.00",
+          marketCap: existing.marketCap,
+          sharesOutstanding: existing.sharesOutstanding,
+          floatShares: existing.floatShares,
+          publicFloat: existing.publicFloat
         };
 
         console.log(`[SEED] ${ticker} = $${priceCache[ticker].price}`);
@@ -540,10 +545,15 @@ async function pollTwelveDataBatch() {
         : "0.00";
 
       if (!isNaN(price) && price > 0) {
+        const existing = priceCache[ticker] || {};
         priceCache[ticker] = {
           price,
           prevClose,
-          changePct
+          changePct,
+          marketCap: existing.marketCap,
+          sharesOutstanding: existing.sharesOutstanding,
+          floatShares: existing.floatShares,
+          publicFloat: existing.publicFloat
         };
 
         updated++;
@@ -616,6 +626,19 @@ function getYahooDisplayPrice(row) {
   return null;
 }
 
+function positiveNumberOrNull(value) {
+  const n = toNumber(value);
+  return n !== null && n > 0 ? n : null;
+}
+
+function firstPositiveNumber(...values) {
+  for (const value of values) {
+    const n = positiveNumberOrNull(value);
+    if (n !== null) return n;
+  }
+  return null;
+}
+
 function applyYahooQuoteToCache(requestedTicker, row) {
   const selected = getYahooDisplayPrice(row);
   if (!selected || !selected.price || selected.price <= 0) return false;
@@ -632,6 +655,11 @@ function applyYahooQuoteToCache(requestedTicker, row) {
     ? (((selected.price - prevClose) / prevClose) * 100).toFixed(2)
     : "0.00";
 
+  const marketCap = firstPositiveNumber(row.marketCap, existing && existing.marketCap);
+  const sharesOutstanding = firstPositiveNumber(row.sharesOutstanding, existing && existing.sharesOutstanding);
+  const floatShares = firstPositiveNumber(row.floatShares, row.sharesFloat, row.freeFloat, row.sharesOutstanding, existing && existing.floatShares);
+  const publicFloat = firstPositiveNumber(floatShares, existing && existing.publicFloat);
+
   priceCache[ticker] = {
     price: selected.price,
     prevClose,
@@ -639,7 +667,11 @@ function applyYahooQuoteToCache(requestedTicker, row) {
     source: selected.source,
     marketState: selected.marketState,
     lastUpdated: selected.time || Math.floor(Date.now() / 1000),
-    fetchedAt: Date.now()
+    fetchedAt: Date.now(),
+    marketCap,
+    sharesOutstanding,
+    floatShares,
+    publicFloat
   };
 
   return true;
@@ -772,7 +804,11 @@ async function fetchYahooChartQuoteFallback(ticker) {
       toNumber(meta.preMarketTime) ||
       lastTimestamp ||
       Math.floor(Date.now() / 1000),
-    fetchedAt: Date.now()
+    fetchedAt: Date.now(),
+    marketCap: existing && existing.marketCap,
+    sharesOutstanding: existing && existing.sharesOutstanding,
+    floatShares: existing && existing.floatShares,
+    publicFloat: existing && existing.publicFloat
   };
 
   return true;
@@ -962,7 +998,11 @@ function handleTradeMessage(msg) {
     priceCache[ticker] = {
       price,
       prevClose,
-      changePct
+      changePct,
+      marketCap: existing && existing.marketCap,
+      sharesOutstanding: existing && existing.sharesOutstanding,
+      floatShares: existing && existing.floatShares,
+      publicFloat: existing && existing.publicFloat
     };
   }
 }
@@ -1046,10 +1086,15 @@ function startFinnhubRestPolling() {
             ? (((data.c - prevClose) / prevClose) * 100).toFixed(2)
             : "0.00";
 
+          const existing = priceCache[ticker] || {};
           priceCache[ticker] = {
             price: data.c,
             prevClose,
-            changePct
+            changePct,
+            marketCap: existing.marketCap,
+            sharesOutstanding: existing.sharesOutstanding,
+            floatShares: existing.floatShares,
+            publicFloat: existing.publicFloat
           };
         }
       } catch (e) {
