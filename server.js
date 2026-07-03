@@ -7,6 +7,7 @@ const PORT = process.env.PORT || 8080;
 app.use(express.json({ limit: "25kb" }));
 
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
+const FMP_API_KEY = process.env.FMP_API_KEY;
 const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY;
 const FREECRYPTO_API_KEY = process.env.FREECRYPTO_API_KEY;
 const FREECRYPTO_BASE_URL = "https://api.freecryptoapi.com/v1";
@@ -661,7 +662,11 @@ function yahooRawNumber(value) {
 }
 
 const yahooFloatMetadataCache = {};
-const YAHOO_FLOAT_METADATA_TTL_MS = Number(process.env.YAHOO_FLOAT_METADATA_TTL_MS || 6 * 60 * 60 * 1000);
+const YAHOO_FLOAT_METADATA_TTL_MS = Number(
+  process.env.FLOAT_METADATA_TTL_MS ||
+  process.env.YAHOO_FLOAT_METADATA_TTL_MS ||
+  24 * 60 * 60 * 1000
+);
 const YAHOO_FLOAT_METADATA_CONCURRENCY = Math.max(1, Math.min(8, Number(process.env.YAHOO_FLOAT_METADATA_CONCURRENCY || 5)));
 
 function getCachedFloatMetadata(displayTicker) {
@@ -721,6 +726,100 @@ function applyFloatMetadataToPriceCache(displayTicker, metadata) {
   }
 
   return Boolean(floatShares || sharesOutstanding || marketCap);
+}
+
+function fmpTickerSymbol(ticker) {
+  return String(ticker || "").toUpperCase().replace(".", "-");
+}
+
+function getFmpRecord(data) {
+  if (Array.isArray(data)) return data[0] || null;
+  if (data && Array.isArray(data.data)) return data.data[0] || null;
+  if (data && typeof data === "object") return data;
+  return null;
+}
+
+function normalizeFmpShareCount(value) {
+  const n = firstDefinedYahooNumber(value);
+  if (!n || n <= 0) return null;
+  return n;
+}
+
+function normalizeFmpFreeFloatPercent(value) {
+  const n = firstDefinedYahooNumber(value);
+  if (!n || n <= 0) return null;
+  if (n <= 1) return n * 100;
+  if (n <= 100) return n;
+  return null;
+}
+
+async function fetchFmpFloatMetadata(displayTicker) {
+  const ticker = String(displayTicker || "").toUpperCase();
+  if (!ticker || !isRealStockTicker(ticker) || !FMP_API_KEY) return false;
+
+  const realTicker = fmpTickerSymbol(getRealTicker(ticker));
+  const url =
+    `https://financialmodelingprep.com/stable/shares-float` +
+    `?symbol=${encodeURIComponent(realTicker)}` +
+    `&apikey=${encodeURIComponent(FMP_API_KEY)}`;
+
+  const resp = await fetchJsonWithTimeout(
+    url,
+    {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "Mozilla/5.0"
+      }
+    },
+    9000
+  );
+
+  if (!resp.ok) {
+    throw new Error(resp.data?.Error || resp.data?.error || `FMP shares-float HTTP ${resp.status}`);
+  }
+
+  const row = getFmpRecord(resp.data);
+  if (!row || typeof row !== "object") {
+    throw new Error("FMP shares-float returned no result");
+  }
+
+  const outstandingShares = normalizeFmpShareCount(
+    row.outstandingShares ??
+    row.sharesOutstanding ??
+    row.shareOutstanding ??
+    row.weightedAverageShsOut ??
+    row.weightedAverageShsOutDil
+  );
+
+  let floatShares = normalizeFmpShareCount(
+    row.floatShares ??
+    row.sharesFloat ??
+    row.freeFloatShares ??
+    row.publicFloat ??
+    row.float
+  );
+
+  const freeFloatPercent = normalizeFmpFreeFloatPercent(
+    row.freeFloat ??
+    row.freeFloatPercentage ??
+    row.freeFloatPercent
+  );
+
+  if (!floatShares && outstandingShares && freeFloatPercent) {
+    floatShares = outstandingShares * (freeFloatPercent / 100);
+  }
+
+  const marketCap = normalizeFmpShareCount(row.marketCap);
+
+  const metadata = {
+    marketCap,
+    sharesOutstanding: outstandingShares,
+    floatShares: floatShares || outstandingShares,
+    publicFloat: floatShares || outstandingShares,
+    source: "FMP shares-float"
+  };
+
+  return applyFloatMetadataToPriceCache(ticker, metadata);
 }
 
 function normalizeFinnhubShareCount(value) {
@@ -791,6 +890,14 @@ async function fetchYahooFloatMetadata(displayTicker) {
   if (cached) {
     applyFloatMetadataToPriceCache(ticker, cached);
     return true;
+  }
+
+  try {
+    if (await fetchFmpFloatMetadata(ticker)) {
+      return true;
+    }
+  } catch (err) {
+    console.warn(`[FMP FLOAT] shares-float failed for ${ticker}: ${err.message}`);
   }
 
   const yahooSymbol = yahooTickerSymbol(getRealTicker(ticker));
@@ -2457,16 +2564,65 @@ async function fetchCryptoCandles(symbol, interval) {
 // GROUP_ROLE_ROOKIE_NAME = Rookie Trader
 // GROUP_ROLE_INTERMEDIATE_NAME = Intermediate Trader
 // GROUP_ROLE_DAY_TRADER_NAME = Day Trader
+// GROUP_ROLE_PROFESSIONAL_NAME = Professional Trader
+// GROUP_ROLE_TOP_TRADER_NAME = Top Trader at GCF
+// GROUP_ROLE_TRADING_MANAGER_NAME = Trading Firm Manager at GCF
+// GROUP_ROLE_CFO_NAME = Chief Financial Officer at GCF
+// GROUP_ROLE_CEO_NAME = Chief Executive Officer at GCF
+// GROUP_ROLE_INDEPENDENT_NAME = Independent Professional Trader
+// GROUP_ROLE_MULTI_MILLIONAIRE_NAME = Multi-Millionaire Trader
 
 const ROBLOX_GROUP_ID = String(process.env.ROBLOX_GROUP_ID || "15696460");
 const ROBLOX_OPEN_CLOUD_API_KEY = process.env.ROBLOX_OPEN_CLOUD_API_KEY || "";
 const GROUP_SYNC_SECRET = process.env.GROUP_SYNC_SECRET || "";
 
-const GAME_ROLE_TO_GROUP_ROLE_NAME = {
-  "Intern Trader": process.env.GROUP_ROLE_INTERN_NAME || "Intern Trader",
-  "Rookie Trader": process.env.GROUP_ROLE_ROOKIE_NAME || "Rookie Trader",
-  "Intermediate Trader": process.env.GROUP_ROLE_INTERMEDIATE_NAME || "Intermediate Trader",
-  "Day Trader": process.env.GROUP_ROLE_DAY_TRADER_NAME || "Day Trader"
+function roleCandidates(envValue, ...fallbackNames) {
+  const names = [];
+  if (envValue) names.push(String(envValue));
+  fallbackNames.forEach(name => names.push(String(name || "")));
+  return [...new Set(names.map(name => name.trim()).filter(Boolean))];
+}
+
+const GAME_ROLE_TO_GROUP_ROLE_CANDIDATES = {
+  "Intern": roleCandidates(process.env.GROUP_ROLE_INTERN_NAME, "Intern Trader", "Intern"),
+  "Intern Trader": roleCandidates(process.env.GROUP_ROLE_INTERN_NAME, "Intern Trader", "Intern"),
+  "Rookie Trader": roleCandidates(process.env.GROUP_ROLE_ROOKIE_NAME, "Rookie Trader"),
+  "Intermediate Trader": roleCandidates(process.env.GROUP_ROLE_INTERMEDIATE_NAME, "Intermediate Trader"),
+  "Day Trader": roleCandidates(process.env.GROUP_ROLE_DAY_TRADER_NAME, "Day Trader"),
+  "Professional Trader": roleCandidates(process.env.GROUP_ROLE_PROFESSIONAL_NAME, "Professional Trader"),
+  "Top Trader at GCF": roleCandidates(process.env.GROUP_ROLE_TOP_TRADER_NAME, "Top Trader at GCF", "Top Trader"),
+  "Trading Firm Manager at GCF": roleCandidates(process.env.GROUP_ROLE_TRADING_MANAGER_NAME, "Trading Firm Manager at GCF", "Trading Firm Manager"),
+  "Chief Financial Officer at GCF": roleCandidates(process.env.GROUP_ROLE_CFO_NAME, "Chief Financial Officer at GCF", "Chief Financial Officer"),
+  "Chief Executive Officer at GCF": roleCandidates(process.env.GROUP_ROLE_CEO_NAME, "Chief Executive Officer at GCF", "Chief Executive Officer"),
+  "Chief Executive Officer": roleCandidates(process.env.GROUP_ROLE_CEO_NAME, "Chief Executive Officer at GCF", "Chief Executive Officer"),
+  "Independent Professional Trader": roleCandidates(process.env.GROUP_ROLE_INDEPENDENT_NAME, "Independent Professional Trader"),
+  "Multi-Millionaire Trader": roleCandidates(process.env.GROUP_ROLE_MULTI_MILLIONAIRE_NAME, "Multi-Millionaire Trader")
+};
+
+const GAME_ROLE_TO_GROUP_ROLE_NAME = Object.fromEntries(
+  Object.entries(GAME_ROLE_TO_GROUP_ROLE_CANDIDATES).map(([role, candidates]) => [role, candidates[0] || role])
+);
+
+const GAME_ROLE_ALIASES = {
+  "intern": "Intern Trader",
+  "intern trader": "Intern Trader",
+  "rookie": "Rookie Trader",
+  "rookie trader": "Rookie Trader",
+  "intermediate": "Intermediate Trader",
+  "intermediate trader": "Intermediate Trader",
+  "day trader": "Day Trader",
+  "professional trader": "Professional Trader",
+  "top trader": "Top Trader at GCF",
+  "top trader at gcf": "Top Trader at GCF",
+  "trading firm manager": "Trading Firm Manager at GCF",
+  "trading firm manager at gcf": "Trading Firm Manager at GCF",
+  "chief financial officer": "Chief Financial Officer at GCF",
+  "chief financial officer at gcf": "Chief Financial Officer at GCF",
+  "chief executive officer": "Chief Executive Officer at GCF",
+  "chief executive officer at gcf": "Chief Executive Officer at GCF",
+  "independent professional trader": "Independent Professional Trader",
+  "multi millionaire trader": "Multi-Millionaire Trader",
+  "multi-millionaire trader": "Multi-Millionaire Trader"
 };
 
 let cachedGroupRolesByDisplayName = null;
@@ -2475,7 +2631,16 @@ const GROUP_ROLE_CACHE_TTL_MS = 10 * 60 * 1000;
 
 function normalizeGameRole(role) {
   role = String(role || "").trim();
-  return Object.prototype.hasOwnProperty.call(GAME_ROLE_TO_GROUP_ROLE_NAME, role) ? role : "";
+  role = role.replace(/^\d+\.\s*/, "");
+  if (Object.prototype.hasOwnProperty.call(GAME_ROLE_TO_GROUP_ROLE_CANDIDATES, role)) return role;
+
+  const normalizedKey = role.toLowerCase().replace(/\s+/g, " ").trim();
+  const alias = GAME_ROLE_ALIASES[normalizedKey];
+  return alias && Object.prototype.hasOwnProperty.call(GAME_ROLE_TO_GROUP_ROLE_CANDIDATES, alias) ? alias : "";
+}
+
+function getGroupRoleCandidates(gameRole) {
+  return GAME_ROLE_TO_GROUP_ROLE_CANDIDATES[gameRole] || [];
 }
 
 function getGroupRoleDisplayName(role) {
@@ -2632,6 +2797,7 @@ app.get("/group-role/status", async (req, res) => {
       groupId: ROBLOX_GROUP_ID,
       openCloudKeyPresent: ROBLOX_OPEN_CLOUD_API_KEY.length > 0,
       roleMap: GAME_ROLE_TO_GROUP_ROLE_NAME,
+      roleCandidates: GAME_ROLE_TO_GROUP_ROLE_CANDIDATES,
       availableGroupRoles: Object.values(roles)
     });
   } catch (e) {
@@ -2651,8 +2817,10 @@ app.post("/group-role/sync", async (req, res) => {
 
   const userId = Number(req.body && req.body.userId);
   const username = String(req.body && req.body.username || "");
-  const gameRole = normalizeGameRole(req.body && req.body.role);
+  const requestedRole = req.body && req.body.role;
+  const gameRole = normalizeGameRole(requestedRole);
   const inGroup = req.body && req.body.inGroup === true;
+  const groupRank = Number(req.body && req.body.groupRank);
 
   if (!Number.isInteger(userId) || userId <= 0) {
     return res.status(400).json({ ok: false, error: "Invalid userId." });
@@ -2662,7 +2830,8 @@ app.post("/group-role/sync", async (req, res) => {
     return res.status(400).json({
       ok: false,
       error: "Invalid game role.",
-      allowedRoles: Object.keys(GAME_ROLE_TO_GROUP_ROLE_NAME)
+      requestedRole,
+      allowedRoles: Object.keys(GAME_ROLE_TO_GROUP_ROLE_CANDIDATES)
     });
   }
 
@@ -2677,23 +2846,35 @@ app.post("/group-role/sync", async (req, res) => {
     });
   }
 
+  if (Number.isFinite(groupRank) && groupRank >= 255) {
+    return res.json({
+      ok: true,
+      skipped: true,
+      reason: "Player is the group owner; Roblox does not allow changing the group owner's role.",
+      userId,
+      username,
+      gameRole,
+      groupRank
+    });
+  }
+
   try {
     let roles = await getGroupRolesByDisplayName(false);
-    const desiredGroupRoleName = GAME_ROLE_TO_GROUP_ROLE_NAME[gameRole];
-    let desiredGroupRole = roles[desiredGroupRoleName];
+    const desiredGroupRoleNames = getGroupRoleCandidates(gameRole);
+    let desiredGroupRole = desiredGroupRoleNames.map(name => roles[name]).find(Boolean);
 
     // If a role was just renamed/created, refresh once before failing.
     if (!desiredGroupRole) {
       roles = await getGroupRolesByDisplayName(true);
-      desiredGroupRole = roles[desiredGroupRoleName];
+      desiredGroupRole = desiredGroupRoleNames.map(name => roles[name]).find(Boolean);
     }
 
     if (!desiredGroupRole) {
       return res.status(400).json({
         ok: false,
-        error: `No group role named "${desiredGroupRoleName}" was found in group ${ROBLOX_GROUP_ID}.`,
+        error: `No matching group role was found for in-game role "${gameRole}" in group ${ROBLOX_GROUP_ID}.`,
         gameRole,
-        wantedGroupRoleName: desiredGroupRoleName,
+        wantedGroupRoleNames: desiredGroupRoleNames,
         availableGroupRoles: Object.keys(roles)
       });
     }
@@ -2714,6 +2895,19 @@ app.post("/group-role/sync", async (req, res) => {
       roblox: robloxResult
     });
   } catch (e) {
+    const errorText = String(e.message || "");
+    const detailText = JSON.stringify(e.data || {});
+    if (e.status === 400 && (errorText.includes("Cannot change the role for the group owner") || detailText.includes("Cannot change the role for the group owner"))) {
+      return res.json({
+        ok: true,
+        skipped: true,
+        reason: "Player is the group owner; Roblox does not allow changing the group owner's role.",
+        userId,
+        username,
+        gameRole
+      });
+    }
+
     console.error("[GROUP ROLE] Sync failed", {
       userId,
       username,
@@ -2840,6 +3034,44 @@ app.get("/crypto/debug", async (req, res) => {
       "FreeCryptoAPI"
     ),
     raw: raw.data
+  });
+});
+
+app.get("/float", async (req, res) => {
+  const ticker = String(req.query.ticker || "").toUpperCase();
+
+  if (!ticker) {
+    return res.json({ error: "Missing ticker." });
+  }
+
+  if (!isRealStockTicker(ticker)) {
+    return res.json({
+      ticker,
+      error: "Unknown stock ticker."
+    });
+  }
+
+  try {
+    await fetchYahooQuotesDeduped([ticker]);
+    await enrichYahooFloatMetadataForTickers([ticker]);
+  } catch (e) {
+    console.warn(`[FLOAT] refresh failed for ${ticker}: ${e.message}`);
+  }
+
+  const row = priceCache[ticker] || {};
+  return res.json({
+    ticker,
+    realTicker: getRealTicker(ticker),
+    fmpEnabled: Boolean(FMP_API_KEY),
+    price: row.price,
+    marketCap: row.marketCap,
+    sharesOutstanding: row.sharesOutstanding,
+    floatShares: row.floatShares,
+    publicFloat: row.publicFloat,
+    source: row.source,
+    marketState: row.marketState,
+    lastUpdated: row.lastUpdated,
+    fetchedAt: row.fetchedAt
   });
 });
 
