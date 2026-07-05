@@ -1537,6 +1537,62 @@ function setCachedCandles(ticker, interval, data) {
   };
 }
 
+const RSI_PERIOD = 14;
+
+function attachRsiToCandles(candles, period = RSI_PERIOD) {
+  if (!Array.isArray(candles)) return candles;
+
+  const out = candles.map(candle => ({ ...candle }));
+  let averageGain = 0;
+  let averageLoss = 0;
+  let seeded = false;
+
+  for (let i = 1; i < out.length; i++) {
+    const previousClose = toNumber(out[i - 1].c ?? out[i - 1].close);
+    const currentClose = toNumber(out[i].c ?? out[i].close);
+
+    if (previousClose === null || currentClose === null) {
+      continue;
+    }
+
+    const change = currentClose - previousClose;
+    const gain = Math.max(change, 0);
+    const loss = Math.max(-change, 0);
+
+    if (i <= period) {
+      averageGain += gain;
+      averageLoss += loss;
+
+      if (i === period) {
+        averageGain /= period;
+        averageLoss /= period;
+        seeded = true;
+      }
+    } else if (seeded) {
+      averageGain = ((averageGain * (period - 1)) + gain) / period;
+      averageLoss = ((averageLoss * (period - 1)) + loss) / period;
+    }
+
+    if (seeded) {
+      let rsi;
+      if (averageLoss === 0) {
+        rsi = 100;
+      } else {
+        const relativeStrength = averageGain / averageLoss;
+        rsi = 100 - (100 / (1 + relativeStrength));
+      }
+
+      out[i].rsi = Number(rsi.toFixed(2));
+    }
+  }
+
+  return out;
+}
+
+function withChartIndicators(candles) {
+  return attachRsiToCandles(candles, RSI_PERIOD);
+}
+
 const stockCandleInFlight = new Map();
 
 async function fetchYahooStockCandlesDeduped(ticker, interval, limit) {
@@ -2485,7 +2541,7 @@ async function fetchCryptoCandles(symbol, interval) {
     return {
       symbol,
       interval,
-      candles: cached.data,
+      candles: withChartIndicators(cached.data),
       cached: true,
       source: cached.source
     };
@@ -2511,7 +2567,7 @@ async function fetchCryptoCandles(symbol, interval) {
       symbol,
       interval,
       pair,
-      candles,
+      candles: withChartIndicators(candles),
       cached: false,
       source: "Binance global"
     };
@@ -2533,7 +2589,7 @@ async function fetchCryptoCandles(symbol, interval) {
       symbol,
       interval,
       pair,
-      candles,
+      candles: withChartIndicators(candles),
       cached: false,
       source: "Binance.US"
     };
@@ -3492,8 +3548,9 @@ app.get("/candles", async (req, res) => {
     return res.json({
       ticker,
       interval: tdInterval,
-      candles: patchStockCandlesWithLivePrice(ticker, tdInterval, cached),
+      candles: withChartIndicators(patchStockCandlesWithLivePrice(ticker, tdInterval, cached)),
       cached: true,
+      indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" },
       livePatched: true
     });
   }
@@ -3508,8 +3565,9 @@ app.get("/candles", async (req, res) => {
     return res.json({
       ticker,
       interval: tdInterval,
-      candles: patchStockCandlesWithLivePrice(ticker, tdInterval, yahooCandles),
+      candles: withChartIndicators(patchStockCandlesWithLivePrice(ticker, tdInterval, yahooCandles)),
       cached: false,
+      indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" },
       livePatched: true,
       synthetic: false,
       source: "Yahoo Finance"
@@ -3581,8 +3639,9 @@ app.get("/candles", async (req, res) => {
     res.json({
       ticker,
       interval: tdInterval,
-      candles: patchStockCandlesWithLivePrice(ticker, tdInterval, candles),
+      candles: withChartIndicators(patchStockCandlesWithLivePrice(ticker, tdInterval, candles)),
       cached: false,
+      indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" },
       livePatched: true,
       synthetic: false,
       source: "Twelve Data"
