@@ -3451,18 +3451,16 @@ function classifyNewsEvent(article, realTicker) {
     expectedResult: eventType.includes("good") ? "bullish" : "bearish",
     score: Number(score.toFixed(2)),
     providerSentiment: sentiment || null,
-    providerReasoning: reasoning || null
+    providerReasoning: null
   };
 }
 
 function normalizeMassiveNewsArticle(article, displayTicker, realTicker) {
   const classification = classifyNewsEvent(article, realTicker);
-  const publisher = article.publisher && typeof article.publisher === "object" ? article.publisher : {};
-
   return {
-    id: String(article.id || `${article.title || "news"}-${article.published_utc || ""}`),
+    id: String(article.id || `market-news-${article.published_utc || Date.now()}`),
     displayTicker,
-    realTicker,
+    realTicker: "",
     eventType: classification.eventType,
     eventTitle: classification.eventTitle,
     eventText: classification.eventText,
@@ -3470,11 +3468,11 @@ function normalizeMassiveNewsArticle(article, displayTicker, realTicker) {
     score: classification.score,
     providerSentiment: classification.providerSentiment,
     providerReasoning: classification.providerReasoning,
-    source: publisher.name || "Market news",
+    source: "Market News Desk",
     publishedAt: article.published_utc || null,
-    headline: article.title || "Real market news detected",
-    summary: article.description || "",
-    articleUrl: article.article_url || article.amp_url || ""
+    headline: "",
+    summary: "",
+    articleUrl: ""
   };
 }
 
@@ -3490,9 +3488,9 @@ async function fetchStockNews(displayTicker) {
     return {
       success: false,
       ticker,
-      realTicker: getRealTicker(ticker),
-      provider: "Massive",
-      error: "MASSIVE_API_KEY is not set in Railway."
+      realTicker: "",
+      provider: "Market Signals",
+      error: "Market news service is not configured."
     };
   }
 
@@ -3511,10 +3509,10 @@ async function fetchStockNews(displayTicker) {
     return {
       success: false,
       ticker,
-      realTicker,
-      provider: "Massive",
+      realTicker: "",
+      provider: "Market Signals",
       status: response.status,
-      error: String(message)
+      error: "Market news service temporarily unavailable."
     };
   }
 
@@ -3530,8 +3528,8 @@ async function fetchStockNews(displayTicker) {
   const data = {
     success: true,
     ticker,
-    realTicker,
-    provider: "Massive",
+    realTicker: "",
+    provider: "Market Signals",
     fetchedAt: Date.now(),
     articles
   };
