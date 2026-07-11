@@ -8,6 +8,8 @@ app.use(express.json({ limit: "25kb" }));
 
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const FMP_API_KEY = process.env.FMP_API_KEY;
+const MASSIVE_API_KEY = process.env.MASSIVE_API_KEY || process.env.POLYGON_API_KEY;
+const MASSIVE_BASE_URL = "https://api.massive.com";
 const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY;
 const FREECRYPTO_API_KEY = process.env.FREECRYPTO_API_KEY;
 const FREECRYPTO_BASE_URL = "https://api.freecryptoapi.com/v1";
@@ -3283,6 +3285,261 @@ app.post("/group-role/sync", async (req, res) => {
   }
 });
 
+
+// ============================
+// Stock News / Generic Market Event Classifier
+// ============================
+const STOCK_NEWS_CACHE_TTL_MS = 30 * 60 * 1000;
+const stockNewsCache = new Map();
+
+const STOCK_NEWS_EVENT_TEMPLATES = {
+  "very_good_news": [
+    {
+      title: "Very good news",
+      body: "A major positive development is being reported. Traders may expect stronger buying pressure if the market reacts well."
+    },
+    {
+      title: "Very good news",
+      body: "Strong bullish news is circulating around this company. The expected reaction is meaningfully positive."
+    },
+    {
+      title: "Very good news",
+      body: "A high-impact positive catalyst has appeared. This is the kind of news that can attract aggressive demand."
+    }
+  ],
+  "good_news": [
+    {
+      title: "Good news",
+      body: "A positive company update is being reported. Traders may expect mild to moderate bullish pressure."
+    },
+    {
+      title: "Good news",
+      body: "The latest news looks favorable for this company. The expected reaction is positive, but not guaranteed."
+    },
+    {
+      title: "Good news",
+      body: "A constructive headline is moving through the market. This could support buying interest."
+    }
+  ],
+  "possibly_good_news": [
+    {
+      title: "Possibly good news",
+      body: "The news appears somewhat favorable, but the market reaction may depend on follow-through and trader interpretation."
+    },
+    {
+      title: "Possibly good news",
+      body: "This update leans positive, but it is not a clear breakout catalyst yet."
+    },
+    {
+      title: "Possibly good news",
+      body: "A mildly bullish signal is being reported. Traders may want confirmation from price action."
+    }
+  ],
+  "possibly_bad_news": [
+    {
+      title: "Possibly bad news",
+      body: "The news leans negative, but the impact is uncertain. Traders may wait to see whether sellers respond."
+    },
+    {
+      title: "Possibly bad news",
+      body: "A mildly bearish signal is being reported. It may pressure the stock if the market takes it seriously."
+    },
+    {
+      title: "Possibly bad news",
+      body: "This update could be unfavorable, but the expected reaction is not clearly severe."
+    }
+  ],
+  "bad_news": [
+    {
+      title: "Bad news",
+      body: "A negative company update is being reported. Traders may expect mild to moderate selling pressure."
+    },
+    {
+      title: "Bad news",
+      body: "The latest news looks unfavorable for this company. The expected reaction is negative, but not guaranteed."
+    },
+    {
+      title: "Bad news",
+      body: "A bearish headline is moving through the market. This could weaken buying interest."
+    }
+  ],
+  "very_bad_news": [
+    {
+      title: "Very bad news",
+      body: "A major negative development is being reported. Traders may expect stronger selling pressure if the market reacts badly."
+    },
+    {
+      title: "Very bad news",
+      body: "Strong bearish news is circulating around this company. The expected reaction is meaningfully negative."
+    },
+    {
+      title: "Very bad news",
+      body: "A high-impact negative catalyst has appeared. This is the kind of news that can trigger aggressive selling."
+    }
+  ]
+};
+
+function hashStringToIndex(value, length) {
+  const text = String(value || "");
+  let hash = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    hash = ((hash << 5) - hash + text.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash) % Math.max(1, length || 1);
+}
+
+function keywordScore(text) {
+  const lower = String(text || "").toLowerCase();
+  let score = 0;
+
+  const veryPositive = [
+    "beats estimates", "record revenue", "record profit", "raises guidance", "raised guidance", "upgrade", "upgraded",
+    "approval", "approved", "breakthrough", "surges", "soars", "jumps", "strong demand", "profit jumps",
+    "earnings beat", "wins contract", "major contract", "buyout", "acquisition offer", "strategic partnership"
+  ];
+  const positive = [
+    "beat", "beats", "growth", "grows", "higher", "strong", "bullish", "positive", "profit", "revenue growth",
+    "expands", "launches", "partnership", "contract", "dividend increase", "share buyback", "buyback", "guidance"
+  ];
+  const veryNegative = [
+    "misses estimates", "cuts guidance", "cut guidance", "downgrade", "downgraded", "sec investigation",
+    "investigation", "lawsuit", "bankruptcy", "delisting", "plunges", "collapses", "crashes", "halts", "recall",
+    "fraud", "restatement", "going concern", "offering prices", "dilution"
+  ];
+  const negative = [
+    "miss", "misses", "loss", "losses", "weak", "bearish", "negative", "lower", "decline", "declines",
+    "falls", "drops", "slumps", "layoffs", "debt", "offering", "secondary offering", "warns", "risk", "cuts"
+  ];
+
+  for (const phrase of veryPositive) if (lower.includes(phrase)) score += 1.6;
+  for (const phrase of positive) if (lower.includes(phrase)) score += 0.7;
+  for (const phrase of veryNegative) if (lower.includes(phrase)) score -= 1.6;
+  for (const phrase of negative) if (lower.includes(phrase)) score -= 0.7;
+
+  return score;
+}
+
+function classifyNewsEvent(article, realTicker) {
+  const insights = Array.isArray(article.insights) ? article.insights : [];
+  const tickerUpper = normalizeStockTicker(realTicker);
+  const matchingInsight = insights.find(insight => normalizeStockTicker(insight && insight.ticker) === tickerUpper) || insights[0] || null;
+  const sentiment = matchingInsight && matchingInsight.sentiment ? String(matchingInsight.sentiment).toLowerCase() : "";
+  const reasoning = matchingInsight && matchingInsight.sentiment_reasoning ? String(matchingInsight.sentiment_reasoning) : "";
+
+  let score = 0;
+  if (sentiment === "positive") score += 1.25;
+  if (sentiment === "negative") score -= 1.25;
+
+  score += keywordScore(`${article.title || ""} ${article.description || ""} ${reasoning}`);
+
+  let eventType = "possibly_good_news";
+  if (score >= 3.0) eventType = "very_good_news";
+  else if (score >= 1.25) eventType = "good_news";
+  else if (score >= 0.25) eventType = "possibly_good_news";
+  else if (score <= -3.0) eventType = "very_bad_news";
+  else if (score <= -1.25) eventType = "bad_news";
+  else if (score <= -0.25) eventType = "possibly_bad_news";
+  else if (sentiment === "negative") eventType = "possibly_bad_news";
+
+  const templates = STOCK_NEWS_EVENT_TEMPLATES[eventType] || STOCK_NEWS_EVENT_TEMPLATES.possibly_good_news;
+  const template = templates[hashStringToIndex(article.id || article.title || article.published_utc, templates.length)];
+
+  return {
+    eventType,
+    eventTitle: template.title,
+    eventText: template.body,
+    expectedResult: eventType.includes("good") ? "bullish" : "bearish",
+    score: Number(score.toFixed(2)),
+    providerSentiment: sentiment || null,
+    providerReasoning: reasoning || null
+  };
+}
+
+function normalizeMassiveNewsArticle(article, displayTicker, realTicker) {
+  const classification = classifyNewsEvent(article, realTicker);
+  const publisher = article.publisher && typeof article.publisher === "object" ? article.publisher : {};
+
+  return {
+    id: String(article.id || `${article.title || "news"}-${article.published_utc || ""}`),
+    displayTicker,
+    realTicker,
+    eventType: classification.eventType,
+    eventTitle: classification.eventTitle,
+    eventText: classification.eventText,
+    expectedResult: classification.expectedResult,
+    score: classification.score,
+    providerSentiment: classification.providerSentiment,
+    providerReasoning: classification.providerReasoning,
+    source: publisher.name || "Market news",
+    publishedAt: article.published_utc || null,
+    headline: article.title || "Real market news detected",
+    summary: article.description || "",
+    articleUrl: article.article_url || article.amp_url || ""
+  };
+}
+
+async function fetchStockNews(displayTicker) {
+  const ticker = normalizeStockTicker(displayTicker);
+  if (!ticker) {
+    return { success: false, error: "Missing ticker." };
+  }
+  if (!isRealStockTicker(ticker)) {
+    return { success: false, ticker, error: "Unknown real-data stock ticker." };
+  }
+  if (!MASSIVE_API_KEY) {
+    return {
+      success: false,
+      ticker,
+      realTicker: getRealTicker(ticker),
+      provider: "Massive",
+      error: "MASSIVE_API_KEY is not set in Railway."
+    };
+  }
+
+  const realTicker = getRealTicker(ticker);
+  const cacheKey = `${ticker}:${realTicker}`;
+  const cached = stockNewsCache.get(cacheKey);
+  if (cached && Date.now() - cached.fetchedAt < STOCK_NEWS_CACHE_TTL_MS) {
+    return { ...cached.data, cached: true };
+  }
+
+  const url = `${MASSIVE_BASE_URL}/v2/reference/news?ticker=${encodeURIComponent(realTicker)}&order=desc&sort=published_utc&limit=10&apiKey=${encodeURIComponent(MASSIVE_API_KEY)}`;
+  const response = await fetchJsonWithTimeout(url).catch(e => ({ ok: false, status: 0, data: { error: e.message } }));
+
+  if (!response.ok || !response.data || !Array.isArray(response.data.results)) {
+    const message = response.data && (response.data.error || response.data.message) ? (response.data.error || response.data.message) : "News provider returned no usable results.";
+    return {
+      success: false,
+      ticker,
+      realTicker,
+      provider: "Massive",
+      status: response.status,
+      error: String(message)
+    };
+  }
+
+  const articles = response.data.results
+    .filter(article => article && typeof article === "object")
+    .filter(article => {
+      const tickers = Array.isArray(article.tickers) ? article.tickers.map(normalizeStockTicker) : [];
+      return tickers.length === 0 || tickers.includes(normalizeStockTicker(realTicker));
+    })
+    .slice(0, 8)
+    .map(article => normalizeMassiveNewsArticle(article, ticker, realTicker));
+
+  const data = {
+    success: true,
+    ticker,
+    realTicker,
+    provider: "Massive",
+    fetchedAt: Date.now(),
+    articles
+  };
+
+  stockNewsCache.set(cacheKey, { fetchedAt: Date.now(), data });
+  return data;
+}
+
 // ============================
 // Routes
 // ============================
@@ -3305,6 +3562,8 @@ app.get("/health", (req, res) => {
     cryptoCached: Object.keys(cryptoPriceCache).length,
     cryptoSourceSample: cryptoPriceCache.BTC && cryptoPriceCache.BTC.source,
     cryptoCandleCacheEntries: Object.keys(cryptoCandleCache).length,
+    massiveNewsApiKeyPresent: Boolean(MASSIVE_API_KEY),
+    stockNewsCacheEntries: stockNewsCache.size,
     yahooOnDemandQuotes: ENABLE_YAHOO_ON_DEMAND_QUOTES,
     yahooBackgroundPolling: ENABLE_YAHOO_QUOTE_POLLING,
     allYahooQuotesMsAgo: allYahooQuotesFetchedAtMs ? Date.now() - allYahooQuotesFetchedAtMs : null,
@@ -3430,6 +3689,13 @@ app.get("/float", async (req, res) => {
     lastUpdated: row.lastUpdated,
     fetchedAt: row.fetchedAt
   });
+});
+
+
+app.get("/news", async (req, res) => {
+  const ticker = String(req.query.ticker || "").toUpperCase();
+  const result = await fetchStockNews(ticker);
+  res.json(result);
 });
 
 app.get("/prices", async (req, res) => {
