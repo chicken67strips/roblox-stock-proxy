@@ -3290,7 +3290,34 @@ app.post("/group-role/sync", async (req, res) => {
 // Stock News / Generic Market Event Classifier
 // ============================
 const STOCK_NEWS_CACHE_TTL_MS = 30 * 60 * 1000;
+const ALL_MARKET_NEWS_CACHE_TTL_MS = 60 * 1000;
 const stockNewsCache = new Map();
+let allMarketNewsCache = null;
+
+const CRYPTO_NEWS_SYMBOLS = new Set(["BTC", "ETH", "SOL", "DOGE", "LTC"]);
+const CRYPTO_NEWS_PROVIDER_TICKERS = {
+  BTC: ["X:BTCUSD", "BTCUSD", "BTC"],
+  ETH: ["X:ETHUSD", "ETHUSD", "ETH"],
+  SOL: ["X:SOLUSD", "SOLUSD", "SOL"],
+  DOGE: ["X:DOGEUSD", "DOGEUSD", "DOGE"],
+  LTC: ["X:LTCUSD", "LTCUSD", "LTC"]
+};
+
+const newsProviderTickerToAsset = new Map();
+for (const [displayTicker, realTicker] of Object.entries(DISPLAY_TICKER_TO_REAL_TICKER)) {
+  newsProviderTickerToAsset.set(normalizeStockTicker(realTicker), { ticker: displayTicker, assetType: "stock", providerTicker: realTicker });
+  newsProviderTickerToAsset.set(normalizeStockTicker(displayTicker), { ticker: displayTicker, assetType: "stock", providerTicker: realTicker });
+}
+for (const displayTicker of TICKERS) {
+  if (!newsProviderTickerToAsset.has(normalizeStockTicker(displayTicker))) {
+    newsProviderTickerToAsset.set(normalizeStockTicker(displayTicker), { ticker: displayTicker, assetType: "stock", providerTicker: getRealTicker(displayTicker) });
+  }
+}
+for (const [symbol, providerTickers] of Object.entries(CRYPTO_NEWS_PROVIDER_TICKERS)) {
+  for (const providerTicker of providerTickers) {
+    newsProviderTickerToAsset.set(normalizeStockTicker(providerTicker), { ticker: symbol, assetType: "crypto", providerTicker });
+  }
+}
 
 const STOCK_NEWS_EVENT_TEMPLATES = {
   "very_good_news": [
@@ -3455,11 +3482,12 @@ function classifyNewsEvent(article, realTicker) {
   };
 }
 
-function normalizeMassiveNewsArticle(article, displayTicker, realTicker) {
-  const classification = classifyNewsEvent(article, realTicker);
+function normalizeMassiveNewsArticle(article, displayTicker, providerTicker, assetType = "stock") {
+  const classification = classifyNewsEvent(article, providerTicker);
   return {
     id: String(article.id || `market-news-${article.published_utc || Date.now()}`),
     displayTicker,
+    assetType: assetType === "crypto" ? "crypto" : "stock",
     realTicker: "",
     eventType: classification.eventType,
     eventTitle: classification.eventTitle,
@@ -3474,6 +3502,182 @@ function normalizeMassiveNewsArticle(article, displayTicker, realTicker) {
     summary: "",
     articleUrl: ""
   };
+}
+
+function resolveNewsAssets(article) {
+  const rawTickers = Array.isArray(article && article.tickers) ? article.tickers : [];
+  const assets = [];
+  const seen = new Set();
+
+  for (const rawTicker of rawTickers) {
+    const asset = newsProviderTickerToAsset.get(normalizeStockTicker(rawTicker));
+    if (!asset) continue;
+
+    const key = `${asset.assetType}:${asset.ticker}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    assets.push({
+      ticker: asset.ticker,
+      assetType: asset.assetType,
+      providerTicker: rawTicker || asset.providerTicker
+    });
+  }
+
+  return assets;
+}
+
+async function fetchAllMarketNews() {
+  if (allMarketNewsCache && Date.now() - allMarketNewsCache.fetchedAt < ALL_MARKET_NEWS_CACHE_TTL_MS) {
+    return { ...allMarketNewsCache.data, cached: true };
+  }
+
+  if (!MASSIVE_API_KEY) {
+    return {
+      success: false,
+      provider: "Market Signals",
+      articles: [],
+      error: "Market news service is not configured."
+    };
+  }
+
+  const url = `${MASSIVE_BASE_URL}/v2/reference/news?order=desc&sort=published_utc&limit=100&apiKey=${encodeURIComponent(MASSIVE_API_KEY)}`;
+  const response = await fetchJsonWithTimeout(url).catch(e => ({ ok: false, status: 0, data: { error: e.message } }));
+
+  if (!response.ok || !response.data || !Array.isArray(response.data.results)) {
+    return {
+      success: false,
+      provider: "Market Signals",
+      articles: [],
+      status: response.status,
+      error: "Market news service temporarily unavailable."
+    };
+  }
+
+  const normalized = [];
+  const seen = new Set();
+
+  for (const article of response.data.results) {
+    if (!article || typeof article !== "object") continue;
+
+    for (const asset of resolveNewsAssets(article)) {
+      const articleId = String(article.id || article.published_utc || "market-news");
+      const key = `${articleId}:${asset.assetType}:${asset.ticker}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      normalized.push(normalizeMassiveNewsArticle(
+        article,
+        asset.ticker,
+        asset.providerTicker,
+        asset.assetType
+      ));
+    }
+  }
+
+  normalized.sort((a, b) => {
+    const aTime = Date.parse(a.publishedAt || "") || 0;
+    const bTime = Date.parse(b.publishedAt || "") || 0;
+    return bTime - aTime;
+  });
+
+  const data = {
+    success: true,
+    provider: "Market Signals",
+    fetchedAt: Date.now(),
+    articles: normalized.slice(0, 60)
+  };
+
+  allMarketNewsCache = { fetchedAt: Date.now(), data };
+  return data;
+}
+
+async function fetchCryptoNews(symbol) {
+  const ticker = normalizeStockTicker(symbol);
+  if (!CRYPTO_NEWS_SYMBOLS.has(ticker)) {
+    return { success: false, ticker, assetType: "crypto", articles: [], error: "Unknown crypto symbol." };
+  }
+  if (!MASSIVE_API_KEY) {
+    return {
+      success: false,
+      ticker,
+      assetType: "crypto",
+      provider: "Market Signals",
+      articles: [],
+      error: "Market news service is not configured."
+    };
+  }
+
+  const cacheKey = `crypto:${ticker}`;
+  const cached = stockNewsCache.get(cacheKey);
+  if (cached && Date.now() - cached.fetchedAt < STOCK_NEWS_CACHE_TTL_MS) {
+    return { ...cached.data, cached: true };
+  }
+
+  const candidates = CRYPTO_NEWS_PROVIDER_TICKERS[ticker] || [];
+  let providerSucceeded = false;
+  let providerStatus = 0;
+  let articles = [];
+
+  for (const providerTicker of candidates) {
+    const url = `${MASSIVE_BASE_URL}/v2/reference/news?ticker=${encodeURIComponent(providerTicker)}&order=desc&sort=published_utc&limit=10&apiKey=${encodeURIComponent(MASSIVE_API_KEY)}`;
+    const response = await fetchJsonWithTimeout(url).catch(e => ({ ok: false, status: 0, data: { error: e.message } }));
+    providerStatus = response.status || providerStatus;
+
+    if (!response.ok || !response.data || !Array.isArray(response.data.results)) {
+      continue;
+    }
+
+    providerSucceeded = true;
+    const candidateKeys = new Set(candidates.map(normalizeStockTicker));
+    const matching = response.data.results
+      .filter(article => article && typeof article === "object")
+      .filter(article => {
+        const articleTickers = Array.isArray(article.tickers) ? article.tickers.map(normalizeStockTicker) : [];
+        return articleTickers.length === 0 || articleTickers.some(value => candidateKeys.has(value));
+      });
+
+    if (matching.length > 0) {
+      articles = matching.slice(0, 8).map(article =>
+        normalizeMassiveNewsArticle(article, ticker, providerTicker, "crypto")
+      );
+      break;
+    }
+  }
+
+  if (articles.length === 0) {
+    const allNews = await fetchAllMarketNews();
+    if (allNews && allNews.success === true && Array.isArray(allNews.articles)) {
+      articles = allNews.articles
+        .filter(article => article && article.assetType === "crypto" && article.displayTicker === ticker)
+        .slice(0, 8);
+      providerSucceeded = true;
+    }
+  }
+
+  if (!providerSucceeded) {
+    return {
+      success: false,
+      ticker,
+      assetType: "crypto",
+      provider: "Market Signals",
+      articles: [],
+      status: providerStatus,
+      error: "Market news service temporarily unavailable."
+    };
+  }
+
+  const data = {
+    success: true,
+    ticker,
+    assetType: "crypto",
+    provider: "Market Signals",
+    fetchedAt: Date.now(),
+    articles
+  };
+
+  stockNewsCache.set(cacheKey, { fetchedAt: Date.now(), data });
+  return data;
 }
 
 async function fetchStockNews(displayTicker) {
@@ -3523,11 +3727,12 @@ async function fetchStockNews(displayTicker) {
       return tickers.length === 0 || tickers.includes(normalizeStockTicker(realTicker));
     })
     .slice(0, 8)
-    .map(article => normalizeMassiveNewsArticle(article, ticker, realTicker));
+    .map(article => normalizeMassiveNewsArticle(article, ticker, realTicker, "stock"));
 
   const data = {
     success: true,
     ticker,
+    assetType: "stock",
     realTicker: "",
     provider: "Market Signals",
     fetchedAt: Date.now(),
@@ -3692,7 +3897,15 @@ app.get("/float", async (req, res) => {
 
 app.get("/news", async (req, res) => {
   const ticker = String(req.query.ticker || "").toUpperCase();
-  const result = await fetchStockNews(ticker);
+  const assetType = String(req.query.assetType || "stock").toLowerCase();
+  const result = assetType === "crypto"
+    ? await fetchCryptoNews(ticker)
+    : await fetchStockNews(ticker);
+  res.json(result);
+});
+
+app.get("/news/all", async (req, res) => {
+  const result = await fetchAllMarketNews();
   res.json(result);
 });
 
