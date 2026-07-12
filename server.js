@@ -1719,81 +1719,152 @@ function makeLiveSyntheticCandle(ticker, interval, tMs, open, close, seedOffset 
 }
 
 function patchStockCandlesWithLivePrice(ticker, interval, candles) {
-  if (!Array.isArray(candles) || candles.length === 0) return candles;
-
-  const seconds = STOCK_CANDLE_INTERVAL_SECONDS[interval];
-  if (!seconds || interval === "1day") return candles;
-
-  const info = priceCache[ticker];
-  const livePrice = info && toNumber(info.price);
-
-  if (!livePrice || livePrice <= 0) return candles;
-
-  const stepMs = seconds * 1000;
-  const nowBucketMs = Math.floor(Date.now() / stepMs) * stepMs;
-  const out = candles.map(c => ({ ...c }));
-  const last = out[out.length - 1];
-  const lastMsRaw = parseStockCandleUtcMs(last.t);
-
-  if (lastMsRaw === null) {
-    const prevClose = toNumber(last.c) || livePrice;
-    out[out.length - 1] = makeLiveSyntheticCandle(ticker, interval, nowBucketMs, prevClose, livePrice, 1);
-    return out;
-  }
-
-  const lastBucketMs = Math.floor(lastMsRaw / stepMs) * stepMs;
-
-  if (lastBucketMs === nowBucketMs) {
-    const open = toNumber(last.o) || toNumber(last.c) || livePrice;
-    const high = Math.max(toNumber(last.h) || open, open, livePrice);
-    const low = Math.max(0.000001, Math.min(toNumber(last.l) || open, open, livePrice));
-
-    last.h = roundCandleNumber(high);
-    last.l = roundCandleNumber(low);
-    last.c = roundCandleNumber(livePrice);
-    return out;
-  }
-
-  if (lastBucketMs > nowBucketMs) {
-    return out;
-  }
-
-  const missingBuckets = Math.min(30, Math.floor((nowBucketMs - lastBucketMs) / stepMs));
-  let previousClose = toNumber(last.c) || livePrice;
-
-  for (let i = 1; i <= missingBuckets; i++) {
-    const tMs = lastBucketMs + i * stepMs;
-    const progress = i / missingBuckets;
-    let close = previousClose + ((livePrice - previousClose) * progress);
-
-    if (i < missingBuckets) {
-      const hash = stableHashString(`${ticker}:${interval}:${tMs}`);
-      const wiggle = (deterministicUnit(hash) - 0.5) * Math.max(livePrice * 0.002, 0.000001);
-      close += wiggle;
-    } else {
-      close = livePrice;
-    }
-
-    const candle = makeLiveSyntheticCandle(ticker, interval, tMs, previousClose, close, i);
-    out.push(candle);
-    previousClose = close;
-
-    while (out.length > candles.length) {
-      out.shift();
-    }
-  }
-
-  return out;
+  // Stock charts must display provider OHLCV only.
+  // Never create/interpolate candles from the current quote, especially while the market is closed.
+  // The old implementation generated fake weekend/overnight price action by filling every missing
+  // time bucket up to Date.now(). Keep the function as a compatibility wrapper, but make it a no-op.
+  return Array.isArray(candles) ? candles.map(candle => ({ ...candle })) : candles;
 }
 
 const YAHOO_INTERVALS = {
-  "1min": { interval: "1m", range: "1d" },
+  "1min": { interval: "1m", range: "5d" },
   "5min": { interval: "5m", range: "5d" },
   "15min": { interval: "15m", range: "5d" },
   "30min": { interval: "30m", range: "1mo" },
   "1h": { interval: "60m", range: "1mo" },
   "1day": { interval: "1d", range: "1y" }
 };
+
+
+function classifyStockSessionFromUnixSeconds(timestampSeconds) {
+  const seconds = Number(timestampSeconds);
+  if (!Number.isFinite(seconds) || seconds <= 0) return "closed";
+
+  const parts = getEasternDateParts(new Date(seconds * 1000));
+  const weekend = parts.wday === 0 || parts.wday === 6;
+  const holiday = getStockMarketHolidayName(parts.year, parts.month, parts.day);
+
+  if (weekend || holiday) return "closed";
+
+  const totalMin = parts.hour * 60 + parts.min;
+  const earlyClose = getEarlyCloseInfo(parts);
+  const regularCloseMin = earlyClose ? earlyClose.regularCloseMin : 16 * 60;
+  const extendedCloseMin = 20 * 60;
+
+  if (totalMin >= 4 * 60 && totalMin < 9 * 60 + 30) return "pre-market";
+  if (totalMin >= 9 * 60 + 30 && totalMin < regularCloseMin) return "regular";
+  if (totalMin >= regularCloseMin && totalMin < extendedCloseMin) return "after-hours";
+
+  return "closed";
+}
+
+function parseExchangeLocalDateTime(value) {
+  const match = String(value || "").match(
+    /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/
+  );
+
+  if (!match) return null;
+
+  return {
+    year: Number(match[1]),
+    month: Number(match[2]),
+    day: Number(match[3]),
+    hour: Number(match[4] || 0),
+    min: Number(match[5] || 0),
+    sec: Number(match[6] || 0),
+    hasTime: match[4] !== undefined
+  };
+}
+
+function easternLocalDateTimeToUnixSeconds(value) {
+  const parts = parseExchangeLocalDateTime(value);
+  if (!parts || !parts.hasTime) return null;
+
+  // Twelve Data stock timestamps are exchange-local. Try both US Eastern offsets
+  // and keep the UTC timestamp that converts back to the exact supplied ET clock.
+  for (const offsetHours of [4, 5]) {
+    const seconds = Math.floor(
+      Date.UTC(
+        parts.year,
+        parts.month - 1,
+        parts.day,
+        parts.hour + offsetHours,
+        parts.min,
+        parts.sec
+      ) / 1000
+    );
+
+    const roundTrip = getEasternDateParts(new Date(seconds * 1000));
+    if (
+      roundTrip.year === parts.year &&
+      roundTrip.month === parts.month &&
+      roundTrip.day === parts.day &&
+      roundTrip.hour === parts.hour &&
+      roundTrip.min === parts.min
+    ) {
+      return seconds;
+    }
+  }
+
+  return null;
+}
+
+function normalizeStockCandleRecord({
+  timestampSeconds,
+  datetime,
+  interval,
+  open,
+  high,
+  low,
+  close,
+  volume
+}) {
+  const o = Number(open);
+  const h = Number(high);
+  const l = Number(low);
+  const c = Number(close);
+  const v = Number(volume) || 0;
+
+  if (
+    !Number.isFinite(o) ||
+    !Number.isFinite(h) ||
+    !Number.isFinite(l) ||
+    !Number.isFinite(c) ||
+    o <= 0 ||
+    h <= 0 ||
+    l <= 0 ||
+    c <= 0
+  ) {
+    return null;
+  }
+
+  let seconds = Number(timestampSeconds);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    seconds = easternLocalDateTimeToUnixSeconds(datetime);
+  }
+
+  const isDaily = interval === "1day";
+  const session = isDaily
+    ? "daily"
+    : (seconds ? classifyStockSessionFromUnixSeconds(seconds) : "closed");
+
+  // Intraday stock charts only contain the actual 4:00 AM-8:00 PM ET trading session.
+  // This also strips any stray weekend/overnight rows returned by a provider.
+  if (!isDaily && session === "closed") return null;
+
+  return {
+    t: seconds
+      ? formatSyntheticStockCandleTime(seconds * 1000, interval)
+      : String(datetime || ""),
+    ts: seconds || undefined,
+    session,
+    o: roundCandleNumber(o),
+    h: roundCandleNumber(h),
+    l: roundCandleNumber(l),
+    c: roundCandleNumber(c),
+    v
+  };
+}
 
 function yahooTickerSymbol(ticker) {
   return getRealTicker(ticker).replace(".", "-");
@@ -1811,7 +1882,7 @@ async function fetchYahooStockCandles(ticker, interval, limit = 200) {
     `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}` +
     `?range=${encodeURIComponent(cfg.range)}` +
     `&interval=${encodeURIComponent(cfg.interval)}` +
-    `&includePrePost=false`;
+    `&includePrePost=true`;
 
   const resp = await fetchJsonWithTimeout(
     url,
@@ -1854,14 +1925,17 @@ async function fetchYahooStockCandles(ticker, interval, limit = 200) {
     if (o === null || h === null || l === null || c === null) continue;
     if (o <= 0 || h <= 0 || l <= 0 || c <= 0) continue;
 
-    candles.push({
-      t: formatSyntheticStockCandleTime(Number(timestamps[i]) * 1000, interval),
-      o: roundCandleNumber(o),
-      h: roundCandleNumber(h),
-      l: roundCandleNumber(l),
-      c: roundCandleNumber(c),
-      v
+    const candle = normalizeStockCandleRecord({
+      timestampSeconds: Number(timestamps[i]),
+      interval,
+      open: o,
+      high: h,
+      low: l,
+      close: c,
+      volume: v
     });
+
+    if (candle) candles.push(candle);
   }
 
   if (candles.length === 0) {
@@ -4028,14 +4102,14 @@ app.get("/candles", async (req, res) => {
       candles: withChartIndicators(patchStockCandlesWithLivePrice(ticker, tdInterval, cached)),
       cached: true,
       indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" },
-      livePatched: true
+      livePatched: false
     });
   }
 
   // Primary stock chart path: Yahoo Finance chart data. This avoids burning
-  // Twelve Data API credits just from players opening charts. Pre-market and
-  // after-hours candles are excluded to reduce sparse intraday chart gaps.
-  // Timestamps are formatted in UTC; the Roblox LocalScript displays them as ET.
+  // Twelve Data API credits just from players opening charts. Intraday requests
+  // include pre-market and after-hours candles; every candle is tagged with its
+  // market session and normalized to UTC for the Roblox client.
   try {
     const yahooCandles = await fetchYahooStockCandlesDeduped(ticker, tdInterval, outputsize);
 
@@ -4045,9 +4119,10 @@ app.get("/candles", async (req, res) => {
       candles: withChartIndicators(patchStockCandlesWithLivePrice(ticker, tdInterval, yahooCandles)),
       cached: false,
       indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" },
-      livePatched: true,
+      livePatched: false,
       synthetic: false,
-      source: "Yahoo Finance"
+      source: "Yahoo Finance",
+      extendedHoursIncluded: tdInterval !== "1day"
     });
   } catch (yahooErr) {
     // Real stocks use Twelve Data as a backup when Yahoo fails. If the backup is disabled for
@@ -4101,14 +4176,18 @@ app.get("/candles", async (req, res) => {
       });
     }
 
-    const candles = data.values.reverse().map(v => ({
-      t: v.datetime,
-      o: parseFloat(v.open),
-      h: parseFloat(v.high),
-      l: parseFloat(v.low),
-      c: parseFloat(v.close),
-      v: parseFloat(v.volume)
-    }));
+    const candles = data.values
+      .reverse()
+      .map(v => normalizeStockCandleRecord({
+        datetime: v.datetime,
+        interval: tdInterval,
+        open: parseFloat(v.open),
+        high: parseFloat(v.high),
+        low: parseFloat(v.low),
+        close: parseFloat(v.close),
+        volume: parseFloat(v.volume)
+      }))
+      .filter(Boolean);
 
     setCachedCandles(ticker, tdInterval, candles);
     twelveDataCandleCreditsUsedToday++;
@@ -4119,9 +4198,10 @@ app.get("/candles", async (req, res) => {
       candles: withChartIndicators(patchStockCandlesWithLivePrice(ticker, tdInterval, candles)),
       cached: false,
       indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" },
-      livePatched: true,
+      livePatched: false,
       synthetic: false,
-      source: "Twelve Data"
+      source: "Twelve Data",
+      extendedHoursIncluded: tdInterval !== "1day"
     });
   } catch (e) {
     res.json({
