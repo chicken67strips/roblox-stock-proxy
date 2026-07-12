@@ -1517,24 +1517,29 @@ function shouldUseTwelveDataCandleBackup(ticker) {
   return ENABLE_TWELVE_DATA_MARKET_CANDLE_BACKUP && isRegularMarketHours();
 }
 
-function getCachedCandles(ticker, interval) {
+function getCachedCandleEntry(ticker, interval) {
   const key = `${ticker}:${interval}`;
   const entry = candleCache[key];
 
   if (!entry) return null;
 
   const age = Date.now() - entry.fetchedAt;
-
   if (age > getCandleTTL(interval)) return null;
 
-  return entry.data;
+  return entry;
 }
 
-function setCachedCandles(ticker, interval, data) {
+function getCachedCandles(ticker, interval) {
+  const entry = getCachedCandleEntry(ticker, interval);
+  return entry ? entry.data : null;
+}
+
+function setCachedCandles(ticker, interval, data, source = "Unknown") {
   const key = `${ticker}:${interval}`;
 
   candleCache[key] = {
     data,
+    source,
     fetchedAt: Date.now()
   };
 }
@@ -1606,7 +1611,7 @@ async function fetchYahooStockCandlesDeduped(ticker, interval, limit) {
 
   const promise = fetchYahooStockCandles(ticker, interval, limit)
     .then(candles => {
-      setCachedCandles(ticker, interval, candles);
+      setCachedCandles(ticker, interval, candles, "Yahoo Finance");
       return candles;
     })
     .finally(() => {
@@ -1724,6 +1729,337 @@ function patchStockCandlesWithLivePrice(ticker, interval, candles) {
   // The old implementation generated fake weekend/overnight price action by filling every missing
   // time bucket up to Date.now(). Keep the function as a compatibility wrapper, but make it a no-op.
   return Array.isArray(candles) ? candles.map(candle => ({ ...candle })) : candles;
+}
+
+
+// ============================
+// Massive stock candles (primary accuracy source)
+// ============================
+// Massive's stock aggregate endpoint is built from qualifying trades and covers
+// pre-market, regular hours, and after-hours. For intraday timeframes we request
+// the provider's one-minute bars and aggregate them locally with a separate anchor
+// for each trading session. That prevents a 30m/1h candle from mixing pre-market
+// trades with the 9:30 AM regular open or regular trades with after-hours.
+const MASSIVE_CANDLE_CONFIG = {
+  "1min": { minutes: 1, lookbackDays: 5 },
+  "5min": { minutes: 5, lookbackDays: 7 },
+  "15min": { minutes: 15, lookbackDays: 14 },
+  "30min": { minutes: 30, lookbackDays: 30 },
+  "1h": { minutes: 60, lookbackDays: 45 },
+  "1day": { daily: true, lookbackDays: 370 }
+};
+
+const massiveStockCandleInFlight = new Map();
+
+function easternPartsToUnixSeconds(parts) {
+  if (!parts) return null;
+
+  const year = Number(parts.year);
+  const month = Number(parts.month);
+  const day = Number(parts.day);
+  const hour = Number(parts.hour) || 0;
+  const min = Number(parts.min) || 0;
+  const sec = Number(parts.sec) || 0;
+
+  if (![year, month, day, hour, min, sec].every(Number.isFinite)) return null;
+
+  // Try EDT and EST, then keep the UTC instant that round-trips to the requested ET clock.
+  for (const offsetHours of [4, 5]) {
+    const seconds = Math.floor(Date.UTC(year, month - 1, day, hour + offsetHours, min, sec) / 1000);
+    const roundTrip = getEasternDateParts(new Date(seconds * 1000));
+
+    if (
+      roundTrip.year === year &&
+      roundTrip.month === month &&
+      roundTrip.day === day &&
+      roundTrip.hour === hour &&
+      roundTrip.min === min
+    ) {
+      return seconds;
+    }
+  }
+
+  return null;
+}
+
+function massiveDateRange(lookbackDays) {
+  const nowEt = getEasternDateParts(new Date());
+  const fromEt = addDaysUtc(nowEt.year, nowEt.month, nowEt.day, -Math.max(1, Number(lookbackDays) || 5));
+
+  return {
+    from: dateKey(fromEt.year, fromEt.month, fromEt.day),
+    to: dateKey(nowEt.year, nowEt.month, nowEt.day)
+  };
+}
+
+async function fetchMassiveAggregateRows(realTicker, multiplier, timespan, lookbackDays) {
+  if (!MASSIVE_API_KEY) {
+    throw new Error("MASSIVE_API_KEY is not set.");
+  }
+
+  const range = massiveDateRange(lookbackDays);
+  const url =
+    `${MASSIVE_BASE_URL}/v2/aggs/ticker/${encodeURIComponent(realTicker)}` +
+    `/range/${encodeURIComponent(multiplier)}/${encodeURIComponent(timespan)}` +
+    `/${encodeURIComponent(range.from)}/${encodeURIComponent(range.to)}` +
+    `?adjusted=true&sort=asc&limit=50000&apiKey=${encodeURIComponent(MASSIVE_API_KEY)}`;
+
+  const resp = await fetchJsonWithTimeout(
+    url,
+    {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "Mozilla/5.0"
+      }
+    },
+    15000
+  );
+
+  if (!resp.ok) {
+    throw new Error(resp.data?.error || resp.data?.message || `Massive aggregate HTTP ${resp.status}`);
+  }
+
+  const rows = resp.data && Array.isArray(resp.data.results) ? resp.data.results : [];
+  if (rows.length === 0) {
+    throw new Error("Massive returned no aggregate bars.");
+  }
+
+  return rows;
+}
+
+function normalizeMassiveMinuteBars(rows) {
+  const normalized = [];
+  const seen = new Set();
+
+  for (const row of rows) {
+    const milliseconds = Number(row && row.t);
+    if (!Number.isFinite(milliseconds) || milliseconds <= 0) continue;
+
+    const seconds = Math.floor(milliseconds / 1000);
+    if (seen.has(seconds)) continue;
+
+    const candle = normalizeStockCandleRecord({
+      timestampSeconds: seconds,
+      interval: "1min",
+      open: row.o,
+      high: row.h,
+      low: row.l,
+      close: row.c,
+      volume: row.v
+    });
+
+    if (!candle) continue;
+
+    // Defensive OHLC validation. Never draw malformed bars.
+    if (candle.h < Math.max(candle.o, candle.c) || candle.l > Math.min(candle.o, candle.c)) {
+      continue;
+    }
+
+    seen.add(seconds);
+    normalized.push(candle);
+  }
+
+  normalized.sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
+  return normalized;
+}
+
+function aggregateMinuteBarsByStockSession(minuteBars, interval, intervalMinutes) {
+  if (intervalMinutes <= 1) {
+    return minuteBars.map(candle => ({ ...candle }));
+  }
+
+  const buckets = new Map();
+
+  for (const candle of minuteBars) {
+    const seconds = Number(candle.ts);
+    if (!Number.isFinite(seconds) || seconds <= 0) continue;
+
+    const parts = getEasternDateParts(new Date(seconds * 1000));
+    const session = normalizeStockSessionNameForServer(candle.session) || classifyStockSessionFromUnixSeconds(seconds);
+    if (session !== "pre-market" && session !== "regular" && session !== "after-hours") continue;
+
+    const earlyClose = getEarlyCloseInfo(parts);
+    const regularCloseMinute = earlyClose ? earlyClose.regularCloseMin : 16 * 60;
+    const sessionStartMinute = session === "pre-market"
+      ? 4 * 60
+      : (session === "regular" ? 9 * 60 + 30 : regularCloseMinute);
+
+    const totalMinute = parts.hour * 60 + parts.min;
+    const offset = totalMinute - sessionStartMinute;
+    if (offset < 0) continue;
+
+    const bucketIndex = Math.floor(offset / intervalMinutes);
+    const bucketStartMinute = sessionStartMinute + bucketIndex * intervalMinutes;
+    const bucketHour = Math.floor(bucketStartMinute / 60);
+    const bucketMinute = bucketStartMinute % 60;
+    const bucketTimestamp = easternPartsToUnixSeconds({
+      year: parts.year,
+      month: parts.month,
+      day: parts.day,
+      hour: bucketHour,
+      min: bucketMinute,
+      sec: 0
+    });
+
+    if (!bucketTimestamp) continue;
+
+    const key = `${parts.year}-${parts.month}-${parts.day}:${session}:${bucketIndex}`;
+    let bucket = buckets.get(key);
+
+    if (!bucket) {
+      bucket = {
+        t: formatSyntheticStockCandleTime(bucketTimestamp * 1000, interval),
+        ts: bucketTimestamp,
+        session,
+        o: candle.o,
+        h: candle.h,
+        l: candle.l,
+        c: candle.c,
+        v: Number(candle.v) || 0,
+        firstSourceTimestamp: seconds,
+        lastSourceTimestamp: seconds
+      };
+      buckets.set(key, bucket);
+    } else {
+      // Rows arrive oldest-first, but preserve correctness even if the provider order changes.
+      if (seconds < bucket.firstSourceTimestamp) {
+        bucket.firstSourceTimestamp = seconds;
+        bucket.o = candle.o;
+      }
+      if (seconds >= bucket.lastSourceTimestamp) {
+        bucket.lastSourceTimestamp = seconds;
+        bucket.c = candle.c;
+      }
+      bucket.h = Math.max(bucket.h, candle.h);
+      bucket.l = Math.min(bucket.l, candle.l);
+      bucket.v += Number(candle.v) || 0;
+    }
+  }
+
+  return [...buckets.values()]
+    .sort((a, b) => a.ts - b.ts)
+    .map(bucket => ({
+      t: bucket.t,
+      ts: bucket.ts,
+      session: bucket.session,
+      o: roundCandleNumber(bucket.o),
+      h: roundCandleNumber(bucket.h),
+      l: roundCandleNumber(bucket.l),
+      c: roundCandleNumber(bucket.c),
+      v: Math.round(bucket.v)
+    }));
+}
+
+function normalizeStockSessionNameForServer(value) {
+  const session = String(value || "").toLowerCase().replace(/_/g, "-").replace(/\s+/g, "-");
+  if (session === "pre" || session === "premarket" || session === "pre-market") return "pre-market";
+  if (session === "regular" || session === "reg" || session === "rth" || session === "open") return "regular";
+  if (session === "post" || session === "post-market" || session === "afterhours" || session === "after-hours") return "after-hours";
+  if (session === "daily") return "daily";
+  if (session === "closed") return "closed";
+  return null;
+}
+
+function normalizeMassiveDailyBars(rows) {
+  const candles = [];
+  const seen = new Set();
+
+  for (const row of rows) {
+    const milliseconds = Number(row && row.t);
+    if (!Number.isFinite(milliseconds) || milliseconds <= 0) continue;
+
+    const seconds = Math.floor(milliseconds / 1000);
+    if (seen.has(seconds)) continue;
+
+    const candle = normalizeStockCandleRecord({
+      timestampSeconds: seconds,
+      interval: "1day",
+      open: row.o,
+      high: row.h,
+      low: row.l,
+      close: row.c,
+      volume: row.v
+    });
+
+    if (!candle) continue;
+    if (candle.h < Math.max(candle.o, candle.c) || candle.l > Math.min(candle.o, candle.c)) continue;
+
+    seen.add(seconds);
+    candles.push(candle);
+  }
+
+  candles.sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
+  return candles;
+}
+
+function candleSeriesLatestTimestamp(candles) {
+  if (!Array.isArray(candles) || candles.length === 0) return null;
+  for (let i = candles.length - 1; i >= 0; i--) {
+    const ts = Number(candles[i] && candles[i].ts);
+    if (Number.isFinite(ts) && ts > 0) return ts;
+  }
+  return null;
+}
+
+function isMassiveCandleSeriesFreshEnough(candles, interval) {
+  const latest = candleSeriesLatestTimestamp(candles);
+  if (!latest) return false;
+
+  const ageMs = Date.now() - latest * 1000;
+  if (ageMs < 0) return true;
+
+  if (interval === "1day") {
+    return ageMs <= 7 * 24 * 60 * 60 * 1000;
+  }
+
+  const status = getMarketSessionStatus();
+  if (status.session === "pre-market" || status.session === "open" || status.session === "after-hours") {
+    const intervalMs = (STOCK_CANDLE_INTERVAL_SECONDS[interval] || 60) * 1000;
+    // Accept real-time or 15-minute-delayed Massive plans. Reject an end-of-day-only
+    // response while the market is actively trading so Yahoo/Twelve can supply live bars.
+    return ageMs <= Math.max(35 * 60 * 1000, intervalMs * 2 + 20 * 60 * 1000);
+  }
+
+  // Closed sessions can legitimately span a weekend or market holiday.
+  return ageMs <= 5 * 24 * 60 * 60 * 1000;
+}
+
+async function fetchMassiveStockCandles(ticker, interval, limit = 200) {
+  const cfg = MASSIVE_CANDLE_CONFIG[interval];
+  if (!cfg) throw new Error("Unsupported Massive stock candle interval.");
+
+  const realTicker = getRealTicker(ticker);
+  let candles;
+
+  if (cfg.daily) {
+    const rows = await fetchMassiveAggregateRows(realTicker, 1, "day", cfg.lookbackDays);
+    candles = normalizeMassiveDailyBars(rows);
+  } else {
+    const rows = await fetchMassiveAggregateRows(realTicker, 1, "minute", cfg.lookbackDays);
+    const minuteBars = normalizeMassiveMinuteBars(rows);
+    candles = aggregateMinuteBarsByStockSession(minuteBars, interval, cfg.minutes);
+  }
+
+  if (!Array.isArray(candles) || candles.length === 0) {
+    throw new Error("Massive returned no usable stock candles.");
+  }
+
+  return candles.slice(-limit);
+}
+
+async function fetchMassiveStockCandlesDeduped(ticker, interval, limit) {
+  const key = `${ticker}:${interval}:${limit}`;
+  if (massiveStockCandleInFlight.has(key)) {
+    return massiveStockCandleInFlight.get(key);
+  }
+
+  const promise = fetchMassiveStockCandles(ticker, interval, limit)
+    .finally(() => {
+      massiveStockCandleInFlight.delete(key);
+    });
+
+  massiveStockCandleInFlight.set(key, promise);
+  return promise;
 }
 
 const YAHOO_INTERVALS = {
@@ -4091,25 +4427,61 @@ app.get("/candles", async (req, res) => {
     });
   }
 
-  const cached = getCachedCandles(ticker, tdInterval);
+  const cachedEntry = getCachedCandleEntry(ticker, tdInterval);
 
-  if (cached) {
+  if (cachedEntry && Array.isArray(cachedEntry.data) && cachedEntry.data.length > 0) {
     triggerYahooQuoteRefresh([ticker]);
 
     return res.json({
       ticker,
       interval: tdInterval,
-      candles: withChartIndicators(patchStockCandlesWithLivePrice(ticker, tdInterval, cached)),
+      candles: withChartIndicators(patchStockCandlesWithLivePrice(ticker, tdInterval, cachedEntry.data)),
       cached: true,
       indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" },
-      livePatched: false
+      livePatched: false,
+      synthetic: false,
+      source: cachedEntry.source || "Cached provider",
+      extendedHoursIncluded: tdInterval !== "1day"
     });
   }
 
-  // Primary stock chart path: Yahoo Finance chart data. This avoids burning
-  // Twelve Data API credits just from players opening charts. Intraday requests
-  // include pre-market and after-hours candles; every candle is tagged with its
-  // market session and normalized to UTC for the Roblox client.
+  let massiveError = null;
+  let massiveStaleCandles = null;
+
+  // Accuracy-first stock chart path: Massive qualifying-trade aggregates.
+  // Intraday timeframes are rebuilt from one-minute bars with session-specific
+  // anchors so pre-market, regular hours, and after-hours can never be blended.
+  if (tdInterval !== "1day" && MASSIVE_API_KEY) {
+    try {
+      const massiveCandles = await fetchMassiveStockCandlesDeduped(ticker, tdInterval, outputsize);
+
+      if (isMassiveCandleSeriesFreshEnough(massiveCandles, tdInterval)) {
+        setCachedCandles(ticker, tdInterval, massiveCandles, "Massive");
+        return res.json({
+          ticker,
+          interval: tdInterval,
+          candles: withChartIndicators(massiveCandles),
+          cached: false,
+          indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" },
+          livePatched: false,
+          synthetic: false,
+          source: "Massive qualifying-trade aggregates",
+          extendedHoursIncluded: tdInterval !== "1day"
+        });
+      }
+
+      // End-of-day Massive plans can be stale while today's market is active.
+      // Keep the accurate historical response as a last resort, but try a live source first.
+      massiveStaleCandles = massiveCandles;
+      massiveError = new Error("Massive candle response is stale for the active market session.");
+    } catch (err) {
+      massiveError = err;
+    }
+  }
+
+  // Live fallback: Yahoo chart data. This is used when Massive is unavailable or
+  // an end-of-day plan has not published the active session yet.
+  let yahooError = null;
   try {
     const yahooCandles = await fetchYahooStockCandlesDeduped(ticker, tdInterval, outputsize);
 
@@ -4121,21 +4493,40 @@ app.get("/candles", async (req, res) => {
       indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" },
       livePatched: false,
       synthetic: false,
-      source: "Yahoo Finance",
+      source: "Yahoo Finance fallback",
       extendedHoursIncluded: tdInterval !== "1day"
     });
-  } catch (yahooErr) {
-    // Real stocks use Twelve Data as a backup when Yahoo fails. If the backup is disabled for
-    // this request/session, return unavailable instead of fabricating candles.
-    if (!shouldUseTwelveDataCandleBackup(ticker)) {
+  } catch (err) {
+    yahooError = err;
+  }
+
+  // Real stocks use Twelve Data as the final live-data backup. If that backup is
+  // disabled while the market is closed, return the accurate Massive historical
+  // series rather than fabricating candles or dropping the chart entirely.
+  if (!shouldUseTwelveDataCandleBackup(ticker)) {
+    if (massiveStaleCandles && massiveStaleCandles.length > 0) {
       return res.json({
         ticker,
         interval: tdInterval,
-        error: "Yahoo did not return usable stock candles, and Twelve Data backup is disabled for this request/session.",
-        providerError: yahooErr.message,
-        synthetic: false
+        candles: withChartIndicators(massiveStaleCandles),
+        cached: false,
+        indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" },
+        livePatched: false,
+        synthetic: false,
+        source: "Massive historical aggregates",
+        stale: true,
+        extendedHoursIncluded: tdInterval !== "1day"
       });
     }
+
+    return res.json({
+      ticker,
+      interval: tdInterval,
+      error: "No accurate stock candle provider returned usable data.",
+      massiveProviderError: massiveError && massiveError.message,
+      yahooProviderError: yahooError && yahooError.message,
+      synthetic: false
+    });
   }
 
   if (!TWELVE_DATA_API_KEY) {
@@ -4189,7 +4580,7 @@ app.get("/candles", async (req, res) => {
       }))
       .filter(Boolean);
 
-    setCachedCandles(ticker, tdInterval, candles);
+    setCachedCandles(ticker, tdInterval, candles, "Twelve Data");
     twelveDataCandleCreditsUsedToday++;
 
     res.json({
