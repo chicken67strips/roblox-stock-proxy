@@ -18,7 +18,7 @@ const priceCache = {};
 
 const TICKERS = [
   "ORNG", "MHRD", "MVDO", "AMZG", "ELPHT", "DATA", "NKLA", "SKYX", "BKSG", "HCC", "ELLY", "PMK", "M", "FMT", "DVS", "WXM",
-  "ABMD", "NFKS", "BUM", "DGBE", "REVL", "MNEY", "VKNEE", "BEAR", "NICY", "PPL", "INFO", "OVER", "WBAB", "SMNY", "BC",
+  "ABMD", "NFKS", "BUM", "DGBE", "REVL", "MNEY", "VKNEE", "BEAR", "NICY", "PPL", "INFO", "OVER", "WBAB", "SMNY", "BC", "RBLX",
   "CHHD", "VSS",
   "MASK", "MNTS", "DSY", "INHD", "CLDI", "AZI", "DXST", "WCT", "AIXI", "CODX", "GOVX", "CHAI", "CDLX", "DCX", "CLPR"
 ];
@@ -55,6 +55,7 @@ const DISPLAY_TICKER_TO_REAL_TICKER = {
   WBAB: "ABNB",
   SMNY: "SBUX",
   BC: "KO",
+  RBLX: "RBLX",
   CHHD: "SCHD",
   VSS: "VOO",
   MASK: "MASK",
