@@ -4594,19 +4594,27 @@ const COMMODITY_DEFINITIONS = {
     name: "Gold",
     unit: "troy ounce",
     twelveCandidates: ["XAU/USD"],
-    yahooSymbol: "GC=F"
+    yahooSymbol: "GC=F",
+    minValidPrice: 100,
+    maxValidPrice: 20000
   },
   SILVER: {
     name: "Silver",
     unit: "troy ounce",
     twelveCandidates: ["XAG/USD"],
-    yahooSymbol: "SI=F"
+    yahooSymbol: "SI=F",
+    minValidPrice: 1,
+    maxValidPrice: 1000
   },
   OIL: {
     name: "WTI Crude Oil",
     unit: "barrel",
-    twelveCandidates: ["WTI/USD", "XTI/USD", "WTI"],
-    yahooSymbol: "CL=F"
+    // IMPORTANT: never use bare "WTI" here. Twelve Data can resolve that as
+    // W&T Offshore stock instead of the WTI crude-oil commodity pair.
+    twelveCandidates: ["WTI/USD"],
+    yahooSymbol: "CL=F",
+    minValidPrice: 10,
+    maxValidPrice: 500
   }
 };
 
@@ -4642,8 +4650,21 @@ function commodityDisplayTickerForProviderSymbol(symbol) {
   return null;
 }
 
+function commodityPriceIsValid(displayTicker, value) {
+  const definition = COMMODITY_DEFINITIONS[normalizeCommodityTicker(displayTicker)];
+  const price = toNumber(value);
+  if (!definition || price === null || price <= 0) return false;
+  const min = Number(definition.minValidPrice) || 0;
+  const max = Number(definition.maxValidPrice) || Number.POSITIVE_INFINITY;
+  return price >= min && price <= max;
+}
+
 function commodityRowIsFresh(row, maxAgeMs = COMMODITY_QUOTE_FRESH_MS) {
-  return Boolean(row && Number(row.price) > 0 && Date.now() - Number(row.receivedAtMs || 0) <= maxAgeMs);
+  return Boolean(
+    row &&
+    commodityPriceIsValid(row.ticker, row.price) &&
+    Date.now() - Number(row.receivedAtMs || 0) <= maxAgeMs
+  );
 }
 
 function updateCommodityPrice(displayTicker, payload) {
@@ -4652,7 +4673,10 @@ function updateCommodityPrice(displayTicker, payload) {
   if (!definition) return false;
 
   const price = toNumber(payload && payload.price);
-  if (price === null || price <= 0) return false;
+  if (!commodityPriceIsValid(displayTicker, price)) {
+    console.warn(`[COMMODITY] Rejected invalid ${displayTicker} price: ${price}`);
+    return false;
+  }
 
   const existing = commodityPriceCache[displayTicker] || {};
   const prevClose = toNumber(payload.prevClose) ?? toNumber(existing.prevClose) ?? price;
@@ -4688,7 +4712,8 @@ async function fetchTwelveDataCommodityQuote(displayTicker) {
   const definition = COMMODITY_DEFINITIONS[displayTicker];
   if (!definition) throw new Error("Unknown commodity ticker.");
 
-  const resolved = commodityResolvedTwelveSymbol[displayTicker];
+  const resolvedCandidate = commodityResolvedTwelveSymbol[displayTicker];
+  const resolved = definition.twelveCandidates.includes(resolvedCandidate) ? resolvedCandidate : null;
   const candidates = resolved
     ? [resolved, ...definition.twelveCandidates.filter(symbol => symbol !== resolved)]
     : definition.twelveCandidates;
@@ -4704,10 +4729,18 @@ async function fetchTwelveDataCommodityQuote(displayTicker) {
         throw new Error(data && data.message ? data.message : "No Twelve Data commodity quote.");
       }
 
-      const price = toNumber(data.close) ?? toNumber(data.price);
-      if (price === null || price <= 0) throw new Error("Twelve Data quote had no usable price.");
+      const returnedSymbol = String(data.symbol || providerSymbol).trim().toUpperCase();
+      if (returnedSymbol !== providerSymbol.toUpperCase()) {
+        throw new Error(`Twelve Data returned ${returnedSymbol} for requested ${providerSymbol}.`);
+      }
 
-      const prevClose = toNumber(data.previous_close) ?? price;
+      const price = toNumber(data.close) ?? toNumber(data.price);
+      if (!commodityPriceIsValid(displayTicker, price)) {
+        throw new Error(`Twelve Data returned an invalid ${displayTicker} price: ${price}`);
+      }
+
+      const prevCloseCandidate = toNumber(data.previous_close);
+      const prevClose = commodityPriceIsValid(displayTicker, prevCloseCandidate) ? prevCloseCandidate : price;
       const percentChange = toNumber(data.percent_change);
       commodityResolvedTwelveSymbol[displayTicker] = providerSymbol;
       updateCommodityPrice(displayTicker, {
@@ -4761,8 +4794,11 @@ async function fetchYahooCommodityQuote(displayTicker) {
     }
   }
 
-  if (latestPrice === null || latestPrice <= 0) throw new Error("Yahoo commodity quote had no usable price.");
-  const prevClose = toNumber(meta.chartPreviousClose) ?? toNumber(meta.previousClose) ?? latestPrice;
+  if (!commodityPriceIsValid(displayTicker, latestPrice)) {
+    throw new Error(`Yahoo returned an invalid ${displayTicker} price: ${latestPrice}`);
+  }
+  const rawPrevClose = toNumber(meta.chartPreviousClose) ?? toNumber(meta.previousClose);
+  const prevClose = commodityPriceIsValid(displayTicker, rawPrevClose) ? rawPrevClose : latestPrice;
 
   updateCommodityPrice(displayTicker, {
     price: latestPrice,
@@ -4911,7 +4947,8 @@ async function fetchTwelveDataCommodityCandles(displayTicker, interval, limit = 
   const definition = COMMODITY_DEFINITIONS[displayTicker];
   if (!definition) throw new Error("Unknown commodity ticker.");
 
-  const resolved = commodityResolvedTwelveSymbol[displayTicker];
+  const resolvedCandidate = commodityResolvedTwelveSymbol[displayTicker];
+  const resolved = definition.twelveCandidates.includes(resolvedCandidate) ? resolvedCandidate : null;
   const candidates = resolved
     ? [resolved, ...definition.twelveCandidates.filter(symbol => symbol !== resolved)]
     : definition.twelveCandidates;
@@ -4936,7 +4973,12 @@ async function fetchTwelveDataCommodityCandles(displayTicker, interval, limit = 
           const h = toNumber(value.high);
           const l = toNumber(value.low);
           const c = toNumber(value.close);
-          if (o === null || h === null || l === null || c === null || o <= 0 || h <= 0 || l <= 0 || c <= 0) return null;
+          if (
+            !commodityPriceIsValid(displayTicker, o) ||
+            !commodityPriceIsValid(displayTicker, h) ||
+            !commodityPriceIsValid(displayTicker, l) ||
+            !commodityPriceIsValid(displayTicker, c)
+          ) return null;
           const ts = Number(value.timestamp) || parseUtcCommodityTimestamp(value.datetime);
           return {
             t: ts ? formatSyntheticStockCandleTime(ts * 1000, interval) : String(value.datetime || ""),
@@ -4993,7 +5035,12 @@ async function fetchYahooCommodityCandles(displayTicker, interval, limit = 200) 
     const h = toNumber(quote.high && quote.high[index]);
     const l = toNumber(quote.low && quote.low[index]);
     const c = toNumber(quote.close && quote.close[index]);
-    if (o === null || h === null || l === null || c === null || o <= 0 || h <= 0 || l <= 0 || c <= 0) continue;
+    if (
+      !commodityPriceIsValid(displayTicker, o) ||
+      !commodityPriceIsValid(displayTicker, h) ||
+      !commodityPriceIsValid(displayTicker, l) ||
+      !commodityPriceIsValid(displayTicker, c)
+    ) continue;
     const ts = Number(timestamps[index]);
     candles.push({
       t: formatSyntheticStockCandleTime(ts * 1000, interval),
