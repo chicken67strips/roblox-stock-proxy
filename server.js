@@ -1515,7 +1515,14 @@ function getCandleTTL(interval) {
 function shouldUseTwelveDataCandleBackup(ticker) {
   if (!isRealStockTicker(ticker)) return false;
   if (ENABLE_TWELVE_DATA_CANDLES) return true;
-  return ENABLE_TWELVE_DATA_MARKET_CANDLE_BACKUP && isRegularMarketHours();
+  if (!ENABLE_TWELVE_DATA_MARKET_CANDLE_BACKUP) return false;
+
+  const parts = getEasternDateParts(new Date());
+  const totalMin = parts.hour * 60 + parts.min;
+
+  // Also permit the backup after today's session has ended. This matters when an
+  // end-of-day Massive plan has not published today's bars yet and Yahoo fails.
+  return isStockTradingDateParts(parts) && totalMin >= 4 * 60;
 }
 
 function getCachedCandleEntry(ticker, interval) {
@@ -1543,6 +1550,10 @@ function setCachedCandles(ticker, interval, data, source = "Unknown") {
     source,
     fetchedAt: Date.now()
   };
+}
+
+function deleteCachedCandles(ticker, interval) {
+  delete candleCache[`${ticker}:${interval}`];
 }
 
 const RSI_PERIOD = 14;
@@ -2002,7 +2013,46 @@ function candleSeriesLatestTimestamp(candles) {
   return null;
 }
 
-function isMassiveCandleSeriesFreshEnough(candles, interval) {
+function isStockTradingDateParts(parts) {
+  return Boolean(
+    parts &&
+    parts.wday !== 0 &&
+    parts.wday !== 6 &&
+    !getStockMarketHolidayName(parts.year, parts.month, parts.day)
+  );
+}
+
+function previousStockTradingDate(parts) {
+  for (let offset = -1; offset >= -14; offset--) {
+    const candidate = addDaysUtc(parts.year, parts.month, parts.day, offset);
+    if (isStockTradingDateParts(candidate)) return candidate;
+  }
+  return addDaysUtc(parts.year, parts.month, parts.day, -1);
+}
+
+function expectedLatestStockCandleDateKey(date = new Date()) {
+  const parts = getEasternDateParts(date);
+  const totalMin = parts.hour * 60 + parts.min;
+
+  // Once pre-market begins, today's chart must contain today's session. Before
+  // 4:00 AM ET, or on a weekend/holiday, the newest legitimate date is the
+  // previous trading day.
+  if (isStockTradingDateParts(parts) && totalMin >= 4 * 60) {
+    return dateKey(parts.year, parts.month, parts.day);
+  }
+
+  const previous = previousStockTradingDate(parts);
+  return dateKey(previous.year, previous.month, previous.day);
+}
+
+function candleSeriesLatestEasternDateKey(candles) {
+  const latest = candleSeriesLatestTimestamp(candles);
+  if (!latest) return null;
+  const parts = getEasternDateParts(new Date(latest * 1000));
+  return dateKey(parts.year, parts.month, parts.day);
+}
+
+function isStockCandleSeriesFreshEnough(candles, interval) {
   const latest = candleSeriesLatestTimestamp(candles);
   if (!latest) return false;
 
@@ -2013,16 +2063,28 @@ function isMassiveCandleSeriesFreshEnough(candles, interval) {
     return ageMs <= 7 * 24 * 60 * 60 * 1000;
   }
 
+  // This is the critical stale-day guard. The old closed-session rule accepted
+  // anything less than five days old, so an end-of-day Massive response from
+  // yesterday could be treated as current immediately after today's 8 PM close.
+  const latestDateKey = candleSeriesLatestEasternDateKey(candles);
+  const expectedDateKey = expectedLatestStockCandleDateKey();
+  if (!latestDateKey || latestDateKey !== expectedDateKey) return false;
+
   const status = getMarketSessionStatus();
   if (status.session === "pre-market" || status.session === "open" || status.session === "after-hours") {
     const intervalMs = (STOCK_CANDLE_INTERVAL_SECONDS[interval] || 60) * 1000;
-    // Accept real-time or 15-minute-delayed Massive plans. Reject an end-of-day-only
-    // response while the market is actively trading so Yahoo/Twelve can supply live bars.
+    // Accept real-time or 15-minute-delayed plans, but never an earlier date.
     return ageMs <= Math.max(35 * 60 * 1000, intervalMs * 2 + 20 * 60 * 1000);
   }
 
-  // Closed sessions can legitimately span a weekend or market holiday.
-  return ageMs <= 5 * 24 * 60 * 60 * 1000;
+  // The expected-date check above handles weekends and holidays. Once today's
+  // extended session has ended, same-day candles remain valid until the next
+  // session begins.
+  return true;
+}
+
+function isMassiveCandleSeriesFreshEnough(candles, interval) {
+  return isStockCandleSeriesFreshEnough(candles, interval);
 }
 
 async function fetchMassiveStockCandles(ticker, interval, limit = 200) {
@@ -2219,7 +2281,7 @@ async function fetchYahooStockCandles(ticker, interval, limit = 200) {
     `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}` +
     `?range=${encodeURIComponent(cfg.range)}` +
     `&interval=${encodeURIComponent(cfg.interval)}` +
-    `&includePrePost=true`;
+    `&includePrePost=true&_=${Date.now()}`;
 
   const resp = await fetchJsonWithTimeout(
     url,
@@ -4766,7 +4828,7 @@ async function fetchYahooCommodityQuote(displayTicker) {
 
   const url =
     `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(definition.yahooSymbol)}` +
-    `?range=5d&interval=1m&includePrePost=true`;
+    `?range=5d&interval=1m&includePrePost=true&_=${Date.now()}`;
   const response = await fetchJsonWithTimeout(
     url,
     { headers: { Accept: "application/json", "User-Agent": "Mozilla/5.0" } },
@@ -5014,7 +5076,7 @@ async function fetchYahooCommodityCandles(displayTicker, interval, limit = 200) 
 
   const url =
     `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(definition.yahooSymbol)}` +
-    `?range=${encodeURIComponent(cfg.range)}&interval=${encodeURIComponent(cfg.interval)}&includePrePost=true`;
+    `?range=${encodeURIComponent(cfg.range)}&interval=${encodeURIComponent(cfg.interval)}&includePrePost=true&_=${Date.now()}`;
   const response = await fetchJsonWithTimeout(
     url,
     { headers: { Accept: "application/json", "User-Agent": "Mozilla/5.0" } },
@@ -5060,6 +5122,93 @@ async function fetchYahooCommodityCandles(displayTicker, interval, limit = 200) 
   return output;
 }
 
+const COMMODITY_CANDLE_INTERVAL_SECONDS = {
+  "1min": 60,
+  "5min": 5 * 60,
+  "15min": 15 * 60,
+  "30min": 30 * 60,
+  "1h": 60 * 60,
+  "1day": 24 * 60 * 60
+};
+
+function isCommodityMarketOpen(date = new Date()) {
+  const parts = getEasternDateParts(date);
+  const totalMin = parts.hour * 60 + parts.min;
+
+  if (parts.wday === 6) return false; // Saturday
+  if (parts.wday === 0) return totalMin >= 18 * 60; // Sunday evening open
+  if (parts.wday === 5) return totalMin < 17 * 60; // Friday close
+
+  // Monday-Thursday daily maintenance break from 5:00-6:00 PM ET.
+  return totalMin < 17 * 60 || totalMin >= 18 * 60;
+}
+
+function isCommodityCandleSeriesFreshEnough(candles, interval) {
+  const latest = candleSeriesLatestTimestamp(candles);
+  if (!latest) return false;
+  if (interval === "1day") return Date.now() - latest * 1000 <= 7 * 24 * 60 * 60 * 1000;
+
+  const ageMs = Date.now() - latest * 1000;
+  if (ageMs < 0) return true;
+
+  if (isCommodityMarketOpen()) {
+    const intervalMs = (COMMODITY_CANDLE_INTERVAL_SECONDS[interval] || 60) * 1000;
+    // Free feeds may be delayed, but a previous-day intraday series is never valid.
+    return ageMs <= Math.max(20 * 60 * 1000, intervalMs * 2 + 5 * 60 * 1000);
+  }
+
+  // Maintenance and weekend closures can legitimately leave the newest candle older.
+  return ageMs <= 3 * 24 * 60 * 60 * 1000;
+}
+
+function patchCommodityCandlesWithLivePrice(displayTicker, interval, candles) {
+  if (!Array.isArray(candles) || candles.length === 0 || interval === "1day") return candles;
+  if (!isCommodityMarketOpen()) return candles;
+
+  const row = commodityPriceCache[displayTicker];
+  if (!commodityRowIsFresh(row, 60 * 1000)) return candles;
+
+  const livePrice = toNumber(row.price);
+  if (!commodityPriceIsValid(displayTicker, livePrice)) return candles;
+
+  const intervalSeconds = COMMODITY_CANDLE_INTERVAL_SECONDS[interval] || 60;
+  const quoteSeconds = Math.max(
+    Number(row.lastUpdated) || 0,
+    Math.floor(Date.now() / 1000)
+  );
+  const bucketStart = Math.floor(quoteSeconds / intervalSeconds) * intervalSeconds;
+  const output = candles.map(candle => ({ ...candle }));
+  const latest = output[output.length - 1];
+  const latestTs = Number(latest && latest.ts) || 0;
+
+  if (latestTs > 0 && Math.floor(latestTs / intervalSeconds) === Math.floor(bucketStart / intervalSeconds)) {
+    latest.c = roundCandleNumber(livePrice);
+    latest.h = roundCandleNumber(Math.max(Number(latest.h) || livePrice, livePrice));
+    latest.l = roundCandleNumber(Math.min(Number(latest.l) || livePrice, livePrice));
+    latest.liveQuotePatched = true;
+    return output;
+  }
+
+  // Add only the real current quote bucket. Do not fabricate the missing candles
+  // between the provider's last bar and now.
+  if (latestTs < bucketStart) {
+    const previousClose = toNumber(latest && latest.c) ?? livePrice;
+    output.push({
+      t: formatSyntheticStockCandleTime(bucketStart * 1000, interval),
+      ts: bucketStart,
+      session: "commodity",
+      o: roundCandleNumber(previousClose),
+      h: roundCandleNumber(Math.max(previousClose, livePrice)),
+      l: roundCandleNumber(Math.min(previousClose, livePrice)),
+      c: roundCandleNumber(livePrice),
+      v: 0,
+      liveQuotePatched: true
+    });
+  }
+
+  return output.slice(-200);
+}
+
 app.get("/commodity/prices", async (req, res) => {
   res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   const force = req.query.fresh === "1" || req.query.fresh === "true";
@@ -5089,6 +5238,9 @@ app.get("/commodity/price", async (req, res) => {
 
 app.get("/commodity/candles", async (req, res) => {
   res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+
   const ticker = normalizeCommodityTicker(req.query.ticker);
   const requestedInterval = String(req.query.interval || "1m");
   const intervalMap = { "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "1d": "1day" };
@@ -5096,52 +5248,92 @@ app.get("/commodity/candles", async (req, res) => {
   if (!isCommodityTicker(ticker)) return res.json({ ticker, error: "Unknown commodity ticker." });
   if (!Object.values(intervalMap).includes(interval)) return res.json({ ticker, error: "Unsupported commodity interval." });
 
+  // Make sure the chart can be reconciled with the same live quote displayed in
+  // the title and order controls.
+  await refreshCommodityQuotes(false);
+
   const cached = getCachedCandleEntry(ticker, interval);
-  if (cached && Array.isArray(cached.data) && cached.data.length > 0) {
+  if (
+    cached &&
+    Array.isArray(cached.data) &&
+    cached.data.length > 0 &&
+    (interval === "1day" || isCommodityCandleSeriesFreshEnough(cached.data, interval))
+  ) {
+    const patched = patchCommodityCandlesWithLivePrice(ticker, interval, cached.data);
     return res.json({
       ticker,
       interval,
-      candles: withChartIndicators(cached.data),
+      candles: withChartIndicators(patched),
       cached: true,
       commodity: true,
       source: cached.source,
+      liveQuotePatched: patched.some(candle => candle.liveQuotePatched === true),
       extendedHoursIncluded: true,
       indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" }
     });
   }
 
+  if (cached) deleteCachedCandles(ticker, interval);
+
   let twelveError = null;
+  let twelveCandles = null;
   if (TWELVE_DATA_API_KEY) {
     try {
-      const candles = await fetchTwelveDataCommodityCandles(ticker, interval, 200);
-      return res.json({
-        ticker,
-        interval,
-        candles: withChartIndicators(candles),
-        cached: false,
-        commodity: true,
-        source: "Twelve Data commodities",
-        extendedHoursIncluded: true,
-        indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" }
-      });
+      twelveCandles = await fetchTwelveDataCommodityCandles(ticker, interval, 200);
+      if (interval === "1day" || isCommodityCandleSeriesFreshEnough(twelveCandles, interval)) {
+        const patched = patchCommodityCandlesWithLivePrice(ticker, interval, twelveCandles);
+        return res.json({
+          ticker,
+          interval,
+          candles: withChartIndicators(patched),
+          cached: false,
+          commodity: true,
+          source: "Twelve Data commodities",
+          liveQuotePatched: patched.some(candle => candle.liveQuotePatched === true),
+          extendedHoursIncluded: true,
+          indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" }
+        });
+      }
+      twelveError = new Error("Twelve Data commodity candles were stale.");
+      deleteCachedCandles(ticker, interval);
     } catch (error) {
       twelveError = error;
+      deleteCachedCandles(ticker, interval);
     }
   }
 
   try {
-    const candles = await fetchYahooCommodityCandles(ticker, interval, 200);
+    const yahooCandles = await fetchYahooCommodityCandles(ticker, interval, 200);
+    const patched = patchCommodityCandlesWithLivePrice(ticker, interval, yahooCandles);
     return res.json({
       ticker,
       interval,
-      candles: withChartIndicators(candles),
+      candles: withChartIndicators(patched),
       cached: false,
       commodity: true,
       source: "Yahoo Finance commodity futures fallback",
+      stale: interval !== "1day" && !isCommodityCandleSeriesFreshEnough(yahooCandles, interval),
+      liveQuotePatched: patched.some(candle => candle.liveQuotePatched === true),
       extendedHoursIncluded: true,
       indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" }
     });
   } catch (yahooError) {
+    if (twelveCandles && twelveCandles.length > 0) {
+      const patched = patchCommodityCandlesWithLivePrice(ticker, interval, twelveCandles);
+      return res.json({
+        ticker,
+        interval,
+        candles: withChartIndicators(patched),
+        cached: false,
+        commodity: true,
+        source: "Twelve Data commodities (stale fallback)",
+        stale: true,
+        liveQuotePatched: patched.some(candle => candle.liveQuotePatched === true),
+        extendedHoursIncluded: true,
+        indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" }
+      });
+    }
+
     return res.json({
       ticker,
       interval,
@@ -5240,6 +5432,10 @@ app.get("/price", async (req, res) => {
 });
 
 app.get("/candles", async (req, res) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+
   const ticker = String(req.query.ticker || "").toUpperCase();
   const interval = req.query.interval || "1min";
 
@@ -5274,7 +5470,12 @@ app.get("/candles", async (req, res) => {
 
   const cachedEntry = getCachedCandleEntry(ticker, tdInterval);
 
-  if (cachedEntry && Array.isArray(cachedEntry.data) && cachedEntry.data.length > 0) {
+  if (
+    cachedEntry &&
+    Array.isArray(cachedEntry.data) &&
+    cachedEntry.data.length > 0 &&
+    (tdInterval === "1day" || isStockCandleSeriesFreshEnough(cachedEntry.data, tdInterval))
+  ) {
     triggerYahooQuoteRefresh([ticker]);
 
     return res.json({
@@ -5288,6 +5489,10 @@ app.get("/candles", async (req, res) => {
       source: cachedEntry.source || "Cached provider",
       extendedHoursIncluded: tdInterval !== "1day"
     });
+  }
+
+  if (cachedEntry && tdInterval !== "1day") {
+    deleteCachedCandles(ticker, tdInterval);
   }
 
   let massiveError = null;
@@ -5330,6 +5535,13 @@ app.get("/candles", async (req, res) => {
   try {
     const yahooCandles = await fetchYahooStockCandlesDeduped(ticker, tdInterval, outputsize);
 
+    if (tdInterval !== "1day" && !isStockCandleSeriesFreshEnough(yahooCandles, tdInterval)) {
+      throw new Error(
+        `Yahoo candle response ended on ${candleSeriesLatestEasternDateKey(yahooCandles) || "an unknown date"}; ` +
+        `expected ${expectedLatestStockCandleDateKey()}.`
+      );
+    }
+
     return res.json({
       ticker,
       interval: tdInterval,
@@ -5343,6 +5555,7 @@ app.get("/candles", async (req, res) => {
     });
   } catch (err) {
     yahooError = err;
+    deleteCachedCandles(ticker, tdInterval);
   }
 
   // Real stocks use Twelve Data as the final live-data backup. If that backup is
