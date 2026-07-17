@@ -5161,6 +5161,22 @@ function isCommodityCandleSeriesFreshEnough(candles, interval) {
   return ageMs <= 3 * 24 * 60 * 60 * 1000;
 }
 
+function normalizeCommodityEpochSeconds(value) {
+  let numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+
+  // Some feeds return seconds, others milliseconds. Normalize both.
+  while (numeric > 100000000000) numeric /= 1000;
+  numeric = Math.floor(numeric);
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  if (numeric > nowSeconds + 5 * 60 || numeric < nowSeconds - 7 * 24 * 60 * 60) {
+    return null;
+  }
+
+  return numeric;
+}
+
 function patchCommodityCandlesWithLivePrice(displayTicker, interval, candles) {
   if (!Array.isArray(candles) || candles.length === 0 || interval === "1day") return candles;
   if (!isCommodityMarketOpen()) return candles;
@@ -5172,37 +5188,57 @@ function patchCommodityCandlesWithLivePrice(displayTicker, interval, candles) {
   if (!commodityPriceIsValid(displayTicker, livePrice)) return candles;
 
   const intervalSeconds = COMMODITY_CANDLE_INTERVAL_SECONDS[interval] || 60;
-  const quoteSeconds = Math.max(
-    Number(row.lastUpdated) || 0,
-    Math.floor(Date.now() / 1000)
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const providerSeconds = normalizeCommodityEpochSeconds(row.lastUpdated);
+  const receivedSeconds = Number(row.receivedAtMs) > 0
+    ? Math.floor(Number(row.receivedAtMs) / 1000)
+    : null;
+
+  // The quote was received now, so use the freshest sane timestamp. Never allow
+  // a millisecond timestamp to create a candle thousands of years in the future.
+  const quoteSeconds = Math.min(
+    nowSeconds,
+    Math.max(providerSeconds || 0, receivedSeconds || 0, nowSeconds - 5)
   );
   const bucketStart = Math.floor(quoteSeconds / intervalSeconds) * intervalSeconds;
-  const output = candles.map(candle => ({ ...candle }));
-  const latest = output[output.length - 1];
-  const latestTs = Number(latest && latest.ts) || 0;
 
-  if (latestTs > 0 && Math.floor(latestTs / intervalSeconds) === Math.floor(bucketStart / intervalSeconds)) {
+  const output = candles
+    .map(candle => ({ ...candle }))
+    .filter(candle => {
+      const ts = normalizeCommodityEpochSeconds(candle && candle.ts);
+      return ts !== null && ts <= nowSeconds + intervalSeconds;
+    })
+    .sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
+
+  if (output.length === 0) return candles;
+
+  const latest = output[output.length - 1];
+  const latestTs = normalizeCommodityEpochSeconds(latest && latest.ts) || 0;
+  const latestBucket = Math.floor(latestTs / intervalSeconds) * intervalSeconds;
+
+  if (latestBucket === bucketStart) {
     latest.c = roundCandleNumber(livePrice);
     latest.h = roundCandleNumber(Math.max(Number(latest.h) || livePrice, livePrice));
     latest.l = roundCandleNumber(Math.min(Number(latest.l) || livePrice, livePrice));
     latest.liveQuotePatched = true;
-    return output;
+    latest.quoteReceivedAt = nowSeconds;
+    return output.slice(-200);
   }
 
-  // Add only the real current quote bucket. Do not fabricate the missing candles
-  // between the provider's last bar and now.
-  if (latestTs < bucketStart) {
-    const previousClose = toNumber(latest && latest.c) ?? livePrice;
+  if (latestBucket < bucketStart) {
+    // This is a real live quote point, not a fabricated path between provider bars.
+    // Use a flat one-point candle because the true bucket open/high/low are unknown.
     output.push({
       t: formatSyntheticStockCandleTime(bucketStart * 1000, interval),
       ts: bucketStart,
       session: "commodity",
-      o: roundCandleNumber(previousClose),
-      h: roundCandleNumber(Math.max(previousClose, livePrice)),
-      l: roundCandleNumber(Math.min(previousClose, livePrice)),
+      o: roundCandleNumber(livePrice),
+      h: roundCandleNumber(livePrice),
+      l: roundCandleNumber(livePrice),
       c: roundCandleNumber(livePrice),
       v: 0,
-      liveQuotePatched: true
+      liveQuotePatched: true,
+      quoteReceivedAt: nowSeconds
     });
   }
 
@@ -5250,7 +5286,7 @@ app.get("/commodity/candles", async (req, res) => {
 
   // Make sure the chart can be reconciled with the same live quote displayed in
   // the title and order controls.
-  await refreshCommodityQuotes(false);
+  await refreshCommodityQuotes(!commodityRowIsFresh(commodityPriceCache[ticker], 15 * 1000));
 
   const cached = getCachedCandleEntry(ticker, interval);
   if (
@@ -5268,6 +5304,8 @@ app.get("/commodity/candles", async (req, res) => {
       commodity: true,
       source: cached.source,
       liveQuotePatched: patched.some(candle => candle.liveQuotePatched === true),
+      livePrice: commodityPriceCache[ticker] && commodityPriceCache[ticker].price,
+      livePriceTimestamp: commodityPriceCache[ticker] && commodityPriceCache[ticker].lastUpdated,
       extendedHoursIncluded: true,
       indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" }
     });
@@ -5290,6 +5328,8 @@ app.get("/commodity/candles", async (req, res) => {
           commodity: true,
           source: "Twelve Data commodities",
           liveQuotePatched: patched.some(candle => candle.liveQuotePatched === true),
+          livePrice: commodityPriceCache[ticker] && commodityPriceCache[ticker].price,
+          livePriceTimestamp: commodityPriceCache[ticker] && commodityPriceCache[ticker].lastUpdated,
           extendedHoursIncluded: true,
           indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" }
         });
@@ -5314,6 +5354,8 @@ app.get("/commodity/candles", async (req, res) => {
       source: "Yahoo Finance commodity futures fallback",
       stale: interval !== "1day" && !isCommodityCandleSeriesFreshEnough(yahooCandles, interval),
       liveQuotePatched: patched.some(candle => candle.liveQuotePatched === true),
+      livePrice: commodityPriceCache[ticker] && commodityPriceCache[ticker].price,
+      livePriceTimestamp: commodityPriceCache[ticker] && commodityPriceCache[ticker].lastUpdated,
       extendedHoursIncluded: true,
       indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" }
     });
@@ -5329,6 +5371,8 @@ app.get("/commodity/candles", async (req, res) => {
         source: "Twelve Data commodities (stale fallback)",
         stale: true,
         liveQuotePatched: patched.some(candle => candle.liveQuotePatched === true),
+        livePrice: commodityPriceCache[ticker] && commodityPriceCache[ticker].price,
+        livePriceTimestamp: commodityPriceCache[ticker] && commodityPriceCache[ticker].lastUpdated,
         extendedHoursIncluded: true,
         indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" }
       });
