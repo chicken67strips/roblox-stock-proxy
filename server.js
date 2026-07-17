@@ -5170,22 +5170,78 @@ function normalizeCommodityEpochSeconds(value) {
   numeric = Math.floor(numeric);
 
   const nowSeconds = Math.floor(Date.now() / 1000);
-  if (numeric > nowSeconds + 5 * 60 || numeric < nowSeconds - 7 * 24 * 60 * 60) {
+  // Candle history can legitimately span months on 1h/1d charts. Only reject
+  // impossible future values or data older than the longest supported history.
+  if (numeric > nowSeconds + 5 * 60 || numeric < nowSeconds - 5 * 365 * 24 * 60 * 60) {
     return null;
   }
 
   return numeric;
 }
 
+function sanitizeCommodityCandleSeries(displayTicker, candles, interval) {
+  if (!Array.isArray(candles)) return [];
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const byTimestamp = new Map();
+
+  for (const candle of candles) {
+    if (!candle || typeof candle !== "object") continue;
+
+    const o = toNumber(candle.o ?? candle.open);
+    const h = toNumber(candle.h ?? candle.high);
+    const l = toNumber(candle.l ?? candle.low);
+    const c = toNumber(candle.c ?? candle.close);
+
+    // A few commodity feeds occasionally emit a placeholder bar containing a
+    // zero OHLC field. One such bar forces the chart scale toward $0 and makes
+    // every legitimate candle look flat. Never cache or return those bars.
+    if (
+      !commodityPriceIsValid(displayTicker, o) ||
+      !commodityPriceIsValid(displayTicker, h) ||
+      !commodityPriceIsValid(displayTicker, l) ||
+      !commodityPriceIsValid(displayTicker, c)
+    ) {
+      continue;
+    }
+
+    let ts = normalizeCommodityEpochSeconds(candle.ts ?? candle.timestamp);
+    if (!ts) ts = parseUtcCommodityTimestamp(candle.t ?? candle.datetime);
+    if (!ts || ts > nowSeconds + 5 * 60) continue;
+
+    // Repair harmless provider inconsistencies while preserving the actual
+    // open and close. High must contain both, and low must contain both.
+    const high = Math.max(h, o, c, l);
+    const low = Math.min(l, o, c, h);
+
+    byTimestamp.set(ts, {
+      ...candle,
+      t: candle.t || formatSyntheticStockCandleTime(ts * 1000, interval),
+      ts,
+      session: "commodity",
+      o: roundCandleNumber(o),
+      h: roundCandleNumber(high),
+      l: roundCandleNumber(low),
+      c: roundCandleNumber(c),
+      v: Math.max(0, toNumber(candle.v ?? candle.volume) || 0)
+    });
+  }
+
+  return Array.from(byTimestamp.values())
+    .sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0))
+    .slice(-200);
+}
+
 function patchCommodityCandlesWithLivePrice(displayTicker, interval, candles) {
-  if (!Array.isArray(candles) || candles.length === 0 || interval === "1day") return candles;
-  if (!isCommodityMarketOpen()) return candles;
+  const sanitized = sanitizeCommodityCandleSeries(displayTicker, candles, interval);
+  if (sanitized.length === 0 || interval === "1day") return sanitized;
+  if (!isCommodityMarketOpen()) return sanitized;
 
   const row = commodityPriceCache[displayTicker];
-  if (!commodityRowIsFresh(row, 60 * 1000)) return candles;
+  if (!commodityRowIsFresh(row, 60 * 1000)) return sanitized;
 
   const livePrice = toNumber(row.price);
-  if (!commodityPriceIsValid(displayTicker, livePrice)) return candles;
+  if (!commodityPriceIsValid(displayTicker, livePrice)) return sanitized;
 
   const intervalSeconds = COMMODITY_CANDLE_INTERVAL_SECONDS[interval] || 60;
   const nowSeconds = Math.floor(Date.now() / 1000);
@@ -5194,40 +5250,27 @@ function patchCommodityCandlesWithLivePrice(displayTicker, interval, candles) {
     ? Math.floor(Number(row.receivedAtMs) / 1000)
     : null;
 
-  // The quote was received now, so use the freshest sane timestamp. Never allow
-  // a millisecond timestamp to create a candle thousands of years in the future.
   const quoteSeconds = Math.min(
     nowSeconds,
     Math.max(providerSeconds || 0, receivedSeconds || 0, nowSeconds - 5)
   );
   const bucketStart = Math.floor(quoteSeconds / intervalSeconds) * intervalSeconds;
-
-  const output = candles
-    .map(candle => ({ ...candle }))
-    .filter(candle => {
-      const ts = normalizeCommodityEpochSeconds(candle && candle.ts);
-      return ts !== null && ts <= nowSeconds + intervalSeconds;
-    })
-    .sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
-
-  if (output.length === 0) return candles;
-
+  const output = sanitized.map(candle => ({ ...candle }));
   const latest = output[output.length - 1];
   const latestTs = normalizeCommodityEpochSeconds(latest && latest.ts) || 0;
   const latestBucket = Math.floor(latestTs / intervalSeconds) * intervalSeconds;
 
   if (latestBucket === bucketStart) {
+    // sanitizeCommodityCandleSeries guarantees valid positive OHLC values here.
     latest.c = roundCandleNumber(livePrice);
-    latest.h = roundCandleNumber(Math.max(Number(latest.h) || livePrice, livePrice));
-    latest.l = roundCandleNumber(Math.min(Number(latest.l) || livePrice, livePrice));
+    latest.h = roundCandleNumber(Math.max(Number(latest.h), Number(latest.o), livePrice));
+    latest.l = roundCandleNumber(Math.min(Number(latest.l), Number(latest.o), livePrice));
     latest.liveQuotePatched = true;
     latest.quoteReceivedAt = nowSeconds;
     return output.slice(-200);
   }
 
   if (latestBucket < bucketStart) {
-    // This is a real live quote point, not a fabricated path between provider bars.
-    // Use a flat one-point candle because the true bucket open/high/low are unknown.
     output.push({
       t: formatSyntheticStockCandleTime(bucketStart * 1000, interval),
       ts: bucketStart,
@@ -5296,7 +5339,7 @@ app.get("/commodity/candles", async (req, res) => {
     (interval === "1day" || isCommodityCandleSeriesFreshEnough(cached.data, interval))
   ) {
     const patched = patchCommodityCandlesWithLivePrice(ticker, interval, cached.data);
-    return res.json({
+    if (patched.length > 0) return res.json({
       ticker,
       interval,
       candles: withChartIndicators(patched),
