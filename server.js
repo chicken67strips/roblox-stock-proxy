@@ -1544,9 +1544,10 @@ function getCachedCandles(ticker, interval) {
 
 function setCachedCandles(ticker, interval, data, source = "Unknown") {
   const key = `${ticker}:${interval}`;
+  const cleanedData = repairIsolatedStockWicks(data, interval);
 
   candleCache[key] = {
-    data,
+    data: cleanedData,
     source,
     fetchedAt: Date.now()
   };
@@ -1872,7 +1873,7 @@ function normalizeMassiveMinuteBars(rows) {
   }
 
   normalized.sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
-  return normalized;
+  return repairIsolatedStockWicks(normalized, "1min");
 }
 
 function aggregateMinuteBarsByStockSession(minuteBars, interval, intervalMinutes) {
@@ -1948,7 +1949,7 @@ function aggregateMinuteBarsByStockSession(minuteBars, interval, intervalMinutes
     }
   }
 
-  return [...buckets.values()]
+  const aggregated = [...buckets.values()]
     .sort((a, b) => a.ts - b.ts)
     .map(bucket => ({
       t: bucket.t,
@@ -1960,6 +1961,8 @@ function aggregateMinuteBarsByStockSession(minuteBars, interval, intervalMinutes
       c: roundCandleNumber(bucket.c),
       v: Math.round(bucket.v)
     }));
+
+  return repairIsolatedStockWicks(aggregated, interval);
 }
 
 function normalizeStockSessionNameForServer(value) {
@@ -2107,7 +2110,7 @@ async function fetchMassiveStockCandles(ticker, interval, limit = 200) {
     throw new Error("Massive returned no usable stock candles.");
   }
 
-  return candles.slice(-limit);
+  return repairIsolatedStockWicks(candles, interval).slice(-limit);
 }
 
 async function fetchMassiveStockCandlesDeduped(ticker, interval, limit) {
@@ -2265,6 +2268,161 @@ function normalizeStockCandleRecord({
   };
 }
 
+
+// Repairs isolated provider bad ticks without smoothing legitimate price action.
+// A bar is changed only when its body and nearby bars remain tightly grouped,
+// one wick is far outside that local market, and the bar does not carry an
+// unusually large volume spike. This specifically removes false vertical wicks
+// occasionally present in aggregate feeds while preserving normal candles.
+function medianFinite(values) {
+  const sorted = values
+    .map(Number)
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b);
+
+  if (sorted.length === 0) return 0;
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1
+    ? sorted[middle]
+    : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+const STOCK_BAD_WICK_MIN_PERCENT = {
+  "1min": 0.0035,
+  "5min": 0.005,
+  "15min": 0.008,
+  "30min": 0.012,
+  "1h": 0.02
+};
+
+function repairIsolatedStockWicks(candles, interval) {
+  if (!Array.isArray(candles) || candles.length < 5 || interval === "1day") {
+    return candles;
+  }
+
+  const intervalSeconds = STOCK_CANDLE_INTERVAL_SECONDS[interval] || 60;
+  const minimumPercent = STOCK_BAD_WICK_MIN_PERCENT[interval] || 0.004;
+  const source = candles.map(candle => ({ ...candle }));
+  const repaired = source.map(candle => ({ ...candle }));
+
+  for (let index = 0; index < source.length; index++) {
+    const candle = source[index];
+    const open = Number(candle.o);
+    const high = Number(candle.h);
+    const low = Number(candle.l);
+    const close = Number(candle.c);
+    const timestamp = Number(candle.ts);
+
+    if (![open, high, low, close].every(Number.isFinite)) continue;
+    if (open <= 0 || high <= 0 || low <= 0 || close <= 0) continue;
+
+    const neighborPrices = [];
+    const neighborMoves = [];
+    const neighborVolumes = [];
+    const neighborBodyValues = [];
+
+    for (let offset = -4; offset <= 4; offset++) {
+      if (offset === 0) continue;
+      const neighbor = source[index + offset];
+      if (!neighbor) continue;
+
+      const neighborTimestamp = Number(neighbor.ts);
+      if (
+        Number.isFinite(timestamp) &&
+        Number.isFinite(neighborTimestamp) &&
+        Math.abs(neighborTimestamp - timestamp) > intervalSeconds * 6
+      ) {
+        continue;
+      }
+
+      if (
+        candle.session &&
+        neighbor.session &&
+        candle.session !== neighbor.session
+      ) {
+        continue;
+      }
+
+      const neighborOpen = Number(neighbor.o);
+      const neighborClose = Number(neighbor.c);
+      if (!Number.isFinite(neighborOpen) || !Number.isFinite(neighborClose)) continue;
+      if (neighborOpen <= 0 || neighborClose <= 0) continue;
+
+      neighborPrices.push(neighborOpen, neighborClose);
+      neighborBodyValues.push(neighborOpen, neighborClose);
+      neighborMoves.push(Math.abs(neighborClose - neighborOpen));
+
+      const neighborVolume = Number(neighbor.v);
+      if (Number.isFinite(neighborVolume) && neighborVolume >= 0) {
+        neighborVolumes.push(neighborVolume);
+      }
+    }
+
+    if (neighborPrices.length < 6) continue;
+
+    const referencePrice = medianFinite(neighborPrices);
+    const typicalMove = medianFinite(neighborMoves);
+    const typicalVolume = medianFinite(neighborVolumes);
+    if (!Number.isFinite(referencePrice) || referencePrice <= 0) continue;
+
+    const bodyLow = Math.min(open, close);
+    const bodyHigh = Math.max(open, close);
+    const bodyRange = Math.abs(close - open);
+    const normalBand = Math.max(referencePrice * 0.00035, typicalMove * 3, 0.005);
+    const bodyNearBand = Math.max(referencePrice * 0.0018, typicalMove * 7, bodyRange * 5, 0.02);
+    const outlierThreshold = Math.max(
+      referencePrice * minimumPercent,
+      typicalMove * 12,
+      bodyRange * 10,
+      0.03
+    );
+
+    const bodyNearReference =
+      Math.abs(open - referencePrice) <= bodyNearBand &&
+      Math.abs(close - referencePrice) <= bodyNearBand;
+
+    const currentVolume = Number(candle.v);
+    const volumeLooksNormal =
+      !Number.isFinite(currentVolume) ||
+      currentVolume < 0 ||
+      typicalVolume <= 0 ||
+      currentVolume <= typicalVolume * 7 + 100;
+
+    if (!bodyNearReference || !volumeLooksNormal) continue;
+
+    let repairedLow = low;
+    let repairedHigh = high;
+
+    const lowWickDistance = bodyLow - low;
+    const highWickDistance = high - bodyHigh;
+
+    if (
+      lowWickDistance > outlierThreshold &&
+      referencePrice - low > outlierThreshold
+    ) {
+      repairedLow = Math.min(bodyLow, referencePrice - normalBand);
+    }
+
+    if (
+      highWickDistance > outlierThreshold &&
+      high - referencePrice > outlierThreshold
+    ) {
+      repairedHigh = Math.max(bodyHigh, referencePrice + normalBand);
+    }
+
+    repairedLow = Math.min(repairedLow, open, close, repairedHigh);
+    repairedHigh = Math.max(repairedHigh, open, close, repairedLow);
+
+    if (repairedLow !== low || repairedHigh !== high) {
+      repaired[index].l = roundCandleNumber(repairedLow);
+      repaired[index].h = roundCandleNumber(repairedHigh);
+      repaired[index].badTickRepaired = true;
+    }
+  }
+
+  return repaired;
+}
+
 function yahooTickerSymbol(ticker) {
   return getRealTicker(ticker).replace(".", "-");
 }
@@ -2341,7 +2499,7 @@ async function fetchYahooStockCandles(ticker, interval, limit = 200) {
     throw new Error("No usable Yahoo candle data returned.");
   }
 
-  return candles.slice(-limit);
+  return repairIsolatedStockWicks(candles, interval).slice(-limit);
 }
 
 function generateSyntheticStockCandles(ticker, interval, limit = 200) {
@@ -5551,11 +5709,13 @@ app.get("/candles", async (req, res) => {
     (tdInterval === "1day" || isStockCandleSeriesFreshEnough(cachedEntry.data, tdInterval))
   ) {
     triggerYahooQuoteRefresh([ticker]);
+    const cleanedCachedCandles = repairIsolatedStockWicks(cachedEntry.data, tdInterval);
+    cachedEntry.data = cleanedCachedCandles;
 
     return res.json({
       ticker,
       interval: tdInterval,
-      candles: withChartIndicators(patchStockCandlesWithLivePrice(ticker, tdInterval, cachedEntry.data)),
+      candles: withChartIndicators(patchStockCandlesWithLivePrice(ticker, tdInterval, cleanedCachedCandles)),
       cached: true,
       indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" },
       livePatched: false,
@@ -5699,18 +5859,21 @@ app.get("/candles", async (req, res) => {
       });
     }
 
-    const candles = data.values
-      .reverse()
-      .map(v => normalizeStockCandleRecord({
-        datetime: v.datetime,
-        interval: tdInterval,
-        open: parseFloat(v.open),
-        high: parseFloat(v.high),
-        low: parseFloat(v.low),
-        close: parseFloat(v.close),
-        volume: parseFloat(v.volume)
-      }))
-      .filter(Boolean);
+    const candles = repairIsolatedStockWicks(
+      data.values
+        .reverse()
+        .map(v => normalizeStockCandleRecord({
+          datetime: v.datetime,
+          interval: tdInterval,
+          open: parseFloat(v.open),
+          high: parseFloat(v.high),
+          low: parseFloat(v.low),
+          close: parseFloat(v.close),
+          volume: parseFloat(v.volume)
+        }))
+        .filter(Boolean),
+      tdInterval
+    );
 
     setCachedCandles(ticker, tdInterval, candles, "Twelve Data");
     twelveDataCandleCreditsUsedToday++;
