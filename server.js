@@ -4689,8 +4689,11 @@ let commodityWs = null;
 let commodityWsLastMessageAt = 0;
 let commodityWsReconnectTimer = null;
 let commodityWsHeartbeatTimer = null;
+const commodityCandleRequestInFlight = new Map();
+const commodityTickerWarmupInFlight = new Set();
+const COMMODITY_CANDLE_WARMUP_INTERVALS = ["1min", "5min", "15min", "30min", "1h", "1day"];
 
-const COMMODITY_QUOTE_FRESH_MS = 15 * 1000;
+const COMMODITY_QUOTE_FRESH_MS = 5 * 1000;
 const COMMODITY_TWELVE_REST_INTERVAL_MS = 60 * 1000;
 const COMMODITY_WS_STALE_MS = 20 * 1000;
 
@@ -4875,38 +4878,24 @@ async function fetchYahooCommodityQuote(displayTicker) {
 async function refreshCommodityQuotes(force = false) {
   if (commodityRefreshInProgress) return commodityRefreshInProgress;
 
-  const allFresh = COMMODITY_TICKERS.every(ticker => commodityRowIsFresh(commodityPriceCache[ticker]));
-  if (!force && allFresh) return commodityPriceCache;
+  const tickersToRefresh = force
+    ? COMMODITY_TICKERS.slice()
+    : COMMODITY_TICKERS.filter(ticker => !commodityRowIsFresh(commodityPriceCache[ticker]));
 
+  if (tickersToRefresh.length === 0) return commodityPriceCache;
+
+  // Quotes and candles must describe the same instruments. The old path mixed
+  // Twelve Data spot quotes (XAU/USD, XAG/USD, WTI/USD) with Yahoo futures
+  // candles (GC=F, SI=F, CL=F), which guaranteed visible chart/quote drift.
+  // Yahoo futures are now authoritative for both the displayed quote and chart.
   commodityRefreshInProgress = (async () => {
-    const websocketHealthy = commodityWsLastMessageAt > 0 && Date.now() - commodityWsLastMessageAt <= COMMODITY_WS_STALE_MS;
-    const shouldRefreshTwelve = Boolean(
-      TWELVE_DATA_API_KEY &&
-      (force || Date.now() - commodityLastTwelveRestRefreshAt >= COMMODITY_TWELVE_REST_INTERVAL_MS)
-    );
-
-    if (shouldRefreshTwelve) {
-      commodityLastTwelveRestRefreshAt = Date.now();
-      const results = await Promise.allSettled(COMMODITY_TICKERS.map(fetchTwelveDataCommodityQuote));
-      results.forEach((result, index) => {
-        if (result.status === "rejected") {
-          console.warn(`[COMMODITY] Twelve Data ${COMMODITY_TICKERS[index]} quote failed: ${result.reason?.message || result.reason}`);
-        }
-      });
-    }
-
-    // When the official stream is unavailable, use the no-key futures feed so
-    // prices continue moving instead of waiting a full minute between REST calls.
-    if (!websocketHealthy) {
-      const fallbackTickers = COMMODITY_TICKERS.filter(ticker => !commodityRowIsFresh(commodityPriceCache[ticker]));
-      const results = await Promise.allSettled(fallbackTickers.map(fetchYahooCommodityQuote));
-      results.forEach((result, index) => {
-        if (result.status === "rejected") {
-          console.warn(`[COMMODITY] Yahoo ${fallbackTickers[index]} quote failed: ${result.reason?.message || result.reason}`);
-        }
-      });
-    }
-
+    const results = await Promise.allSettled(tickersToRefresh.map(fetchYahooCommodityQuote));
+    results.forEach((result, index) => {
+      if (result.status === "rejected") {
+        const ticker = tickersToRefresh[index];
+        console.warn(`[COMMODITY] Yahoo ${ticker} quote failed: ${result.reason?.message || result.reason}`);
+      }
+    });
     return commodityPriceCache;
   })().finally(() => {
     commodityRefreshInProgress = null;
@@ -5074,52 +5063,116 @@ async function fetchYahooCommodityCandles(displayTicker, interval, limit = 200) 
   if (!definition) throw new Error("Unknown commodity ticker.");
   if (!cfg) throw new Error("Unsupported commodity candle interval.");
 
-  const url =
-    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(definition.yahooSymbol)}` +
-    `?range=${encodeURIComponent(cfg.range)}&interval=${encodeURIComponent(cfg.interval)}&includePrePost=true&_=${Date.now()}`;
-  const response = await fetchJsonWithTimeout(
-    url,
-    { headers: { Accept: "application/json", "User-Agent": "Mozilla/5.0" } },
-    12000
-  );
-  if (!response.ok) throw new Error(`Yahoo commodity candle HTTP ${response.status}`);
+  let lastError = null;
+  for (const host of ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]) {
+    try {
+      const url =
+        `https://${host}/v8/finance/chart/${encodeURIComponent(definition.yahooSymbol)}` +
+        `?range=${encodeURIComponent(cfg.range)}&interval=${encodeURIComponent(cfg.interval)}` +
+        `&includePrePost=true&events=div%2Csplits&_=${Date.now()}`;
+      const response = await fetchJsonWithTimeout(
+        url,
+        { headers: { Accept: "application/json", "User-Agent": "Mozilla/5.0" } },
+        6500
+      );
+      if (!response.ok) throw new Error(`Yahoo commodity candle HTTP ${response.status}`);
 
-  const chart = response.data && response.data.chart;
-  const result = chart && Array.isArray(chart.result) && chart.result[0];
-  if (!result) throw new Error(chart?.error?.description || "No Yahoo commodity candle result.");
-  const timestamps = Array.isArray(result.timestamp) ? result.timestamp : [];
-  const quote = result.indicators && result.indicators.quote && result.indicators.quote[0];
-  if (!quote || timestamps.length === 0) throw new Error("Yahoo commodity candles were empty.");
+      const chart = response.data && response.data.chart;
+      const result = chart && Array.isArray(chart.result) && chart.result[0];
+      if (!result) throw new Error(chart?.error?.description || "No Yahoo commodity candle result.");
+      const timestamps = Array.isArray(result.timestamp) ? result.timestamp : [];
+      const quote = result.indicators && result.indicators.quote && result.indicators.quote[0];
+      if (!quote || timestamps.length === 0) throw new Error("Yahoo commodity candles were empty.");
 
-  const candles = [];
-  for (let index = 0; index < timestamps.length; index++) {
-    const o = toNumber(quote.open && quote.open[index]);
-    const h = toNumber(quote.high && quote.high[index]);
-    const l = toNumber(quote.low && quote.low[index]);
-    const c = toNumber(quote.close && quote.close[index]);
-    if (
-      !commodityPriceIsValid(displayTicker, o) ||
-      !commodityPriceIsValid(displayTicker, h) ||
-      !commodityPriceIsValid(displayTicker, l) ||
-      !commodityPriceIsValid(displayTicker, c)
-    ) continue;
-    const ts = Number(timestamps[index]);
-    candles.push({
-      t: formatSyntheticStockCandleTime(ts * 1000, interval),
-      ts,
-      session: "commodity",
-      o: roundCandleNumber(o),
-      h: roundCandleNumber(h),
-      l: roundCandleNumber(l),
-      c: roundCandleNumber(c),
-      v: toNumber(quote.volume && quote.volume[index]) || 0
-    });
+      const candles = [];
+      for (let index = 0; index < timestamps.length; index++) {
+        const o = toNumber(quote.open && quote.open[index]);
+        const h = toNumber(quote.high && quote.high[index]);
+        const l = toNumber(quote.low && quote.low[index]);
+        const c = toNumber(quote.close && quote.close[index]);
+        if (
+          !commodityPriceIsValid(displayTicker, o) ||
+          !commodityPriceIsValid(displayTicker, h) ||
+          !commodityPriceIsValid(displayTicker, l) ||
+          !commodityPriceIsValid(displayTicker, c)
+        ) continue;
+        const ts = Number(timestamps[index]);
+        candles.push({
+          t: formatSyntheticStockCandleTime(ts * 1000, interval),
+          ts,
+          session: "commodity",
+          o: roundCandleNumber(o),
+          h: roundCandleNumber(Math.max(h, o, c, l)),
+          l: roundCandleNumber(Math.min(l, o, c, h)),
+          c: roundCandleNumber(c),
+          v: Math.max(0, toNumber(quote.volume && quote.volume[index]) || 0)
+        });
+      }
+
+      const output = sanitizeCommodityCandleSeries(displayTicker, candles, interval).slice(-limit);
+      if (output.length === 0) throw new Error("Yahoo returned no usable commodity candles.");
+      setCachedCandles(displayTicker, interval, output, "Yahoo Finance commodity futures");
+      return output;
+    } catch (error) {
+      lastError = error;
+    }
   }
 
-  if (candles.length === 0) throw new Error("Yahoo returned no usable commodity candles.");
-  const output = candles.slice(-limit);
-  setCachedCandles(displayTicker, interval, output, "Yahoo Finance commodity futures fallback");
-  return output;
+  throw lastError || new Error("Yahoo commodity candles failed.");
+}
+
+function getAnyCommodityCandleCacheEntry(ticker, interval) {
+  return candleCache[`${ticker}:${interval}`] || null;
+}
+
+async function getCommodityCandlesFast(ticker, interval) {
+  const fresh = getCachedCandleEntry(ticker, interval);
+  if (fresh && Array.isArray(fresh.data) && fresh.data.length > 0) {
+    return { entry: fresh, candles: fresh.data, cached: true };
+  }
+
+  const key = `${ticker}:${interval}`;
+  if (!commodityCandleRequestInFlight.has(key)) {
+    const request = fetchYahooCommodityCandles(ticker, interval, 200)
+      .then(candles => ({
+        entry: getAnyCommodityCandleCacheEntry(ticker, interval),
+        candles,
+        cached: false
+      }))
+      .finally(() => commodityCandleRequestInFlight.delete(key));
+    commodityCandleRequestInFlight.set(key, request);
+  }
+
+  try {
+    return await commodityCandleRequestInFlight.get(key);
+  } catch (error) {
+    const stale = getAnyCommodityCandleCacheEntry(ticker, interval);
+    const staleCandles = stale && sanitizeCommodityCandleSeries(ticker, stale.data, interval);
+    if (staleCandles && staleCandles.length > 0) {
+      return { entry: stale, candles: staleCandles, cached: true, stale: true, error };
+    }
+    throw error;
+  }
+}
+
+function queueCommodityTickerCandleWarmup(ticker, requestedInterval) {
+  if (commodityTickerWarmupInFlight.has(ticker)) return;
+  commodityTickerWarmupInFlight.add(ticker);
+
+  setTimeout(async () => {
+    try {
+      const intervals = COMMODITY_CANDLE_WARMUP_INTERVALS.filter(interval => interval !== requestedInterval);
+      // Limit concurrency to two requests so warmup never overwhelms Yahoo or
+      // creates a large temporary memory spike.
+      for (let index = 0; index < intervals.length; index += 2) {
+        await Promise.allSettled(
+          intervals.slice(index, index + 2).map(interval => getCommodityCandlesFast(ticker, interval))
+        );
+      }
+    } finally {
+      commodityTickerWarmupInFlight.delete(ticker);
+    }
+  }, 0);
 }
 
 const COMMODITY_CANDLE_INTERVAL_SECONDS = {
@@ -5299,9 +5352,7 @@ app.get("/commodity/prices", async (req, res) => {
   res.json({
     success: Object.keys(prices).length > 0,
     prices,
-    source: commodityWsLastMessageAt > 0 && Date.now() - commodityWsLastMessageAt <= COMMODITY_WS_STALE_MS
-      ? "Twelve Data commodities WebSocket"
-      : "Twelve Data / Yahoo fallback",
+    source: "Yahoo Finance commodity futures",
     updatedAt: Math.floor(Date.now() / 1000),
     streamHealthy: commodityWsLastMessageAt > 0 && Date.now() - commodityWsLastMessageAt <= COMMODITY_WS_STALE_MS
   });
@@ -5327,107 +5378,43 @@ app.get("/commodity/candles", async (req, res) => {
   if (!isCommodityTicker(ticker)) return res.json({ ticker, error: "Unknown commodity ticker." });
   if (!Object.values(intervalMap).includes(interval)) return res.json({ ticker, error: "Unsupported commodity interval." });
 
-  // Make sure the chart can be reconciled with the same live quote displayed in
-  // the title and order controls.
-  await refreshCommodityQuotes(!commodityRowIsFresh(commodityPriceCache[ticker], 15 * 1000));
-
-  const cached = getCachedCandleEntry(ticker, interval);
-  if (
-    cached &&
-    Array.isArray(cached.data) &&
-    cached.data.length > 0 &&
-    (interval === "1day" || isCommodityCandleSeriesFreshEnough(cached.data, interval))
-  ) {
-    const patched = patchCommodityCandlesWithLivePrice(ticker, interval, cached.data);
-    if (patched.length > 0) return res.json({
-      ticker,
-      interval,
-      candles: withChartIndicators(patched),
-      cached: true,
-      commodity: true,
-      source: cached.source,
-      liveQuotePatched: patched.some(candle => candle.liveQuotePatched === true),
-      livePrice: commodityPriceCache[ticker] && commodityPriceCache[ticker].price,
-      livePriceTimestamp: commodityPriceCache[ticker] && commodityPriceCache[ticker].lastUpdated,
-      extendedHoursIncluded: true,
-      indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" }
-    });
-  }
-
-  if (cached) deleteCachedCandles(ticker, interval);
-
-  let twelveError = null;
-  let twelveCandles = null;
-  if (TWELVE_DATA_API_KEY) {
-    try {
-      twelveCandles = await fetchTwelveDataCommodityCandles(ticker, interval, 200);
-      if (interval === "1day" || isCommodityCandleSeriesFreshEnough(twelveCandles, interval)) {
-        const patched = patchCommodityCandlesWithLivePrice(ticker, interval, twelveCandles);
-        return res.json({
-          ticker,
-          interval,
-          candles: withChartIndicators(patched),
-          cached: false,
-          commodity: true,
-          source: "Twelve Data commodities",
-          liveQuotePatched: patched.some(candle => candle.liveQuotePatched === true),
-          livePrice: commodityPriceCache[ticker] && commodityPriceCache[ticker].price,
-          livePriceTimestamp: commodityPriceCache[ticker] && commodityPriceCache[ticker].lastUpdated,
-          extendedHoursIncluded: true,
-          indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" }
-        });
-      }
-      twelveError = new Error("Twelve Data commodity candles were stale.");
-      deleteCachedCandles(ticker, interval);
-    } catch (error) {
-      twelveError = error;
-      deleteCachedCandles(ticker, interval);
-    }
+  // Never make chart loading wait for a separate quote request. The chart can
+  // render from futures candles immediately; a quote refresh runs alongside it.
+  if (!commodityRowIsFresh(commodityPriceCache[ticker], 5 * 1000)) {
+    refreshCommodityQuotes(false).catch(error =>
+      console.warn(`[COMMODITY] Background quote refresh failed: ${error.message}`)
+    );
   }
 
   try {
-    const yahooCandles = await fetchYahooCommodityCandles(ticker, interval, 200);
-    const patched = patchCommodityCandlesWithLivePrice(ticker, interval, yahooCandles);
+    const result = await getCommodityCandlesFast(ticker, interval);
+    const patched = patchCommodityCandlesWithLivePrice(ticker, interval, result.candles);
+    if (!patched.length) throw new Error("Commodity provider returned no valid candles.");
+
+    queueCommodityTickerCandleWarmup(ticker, interval);
+
     return res.json({
       ticker,
       interval,
       candles: withChartIndicators(patched),
-      cached: false,
+      cached: result.cached === true,
+      stale: result.stale === true,
       commodity: true,
-      source: "Yahoo Finance commodity futures fallback",
-      stale: interval !== "1day" && !isCommodityCandleSeriesFreshEnough(yahooCandles, interval),
+      source: result.entry?.source || "Yahoo Finance commodity futures",
       liveQuotePatched: patched.some(candle => candle.liveQuotePatched === true),
       livePrice: commodityPriceCache[ticker] && commodityPriceCache[ticker].price,
       livePriceTimestamp: commodityPriceCache[ticker] && commodityPriceCache[ticker].lastUpdated,
       extendedHoursIncluded: true,
       indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" }
     });
-  } catch (yahooError) {
-    if (twelveCandles && twelveCandles.length > 0) {
-      const patched = patchCommodityCandlesWithLivePrice(ticker, interval, twelveCandles);
-      return res.json({
-        ticker,
-        interval,
-        candles: withChartIndicators(patched),
-        cached: false,
-        commodity: true,
-        source: "Twelve Data commodities (stale fallback)",
-        stale: true,
-        liveQuotePatched: patched.some(candle => candle.liveQuotePatched === true),
-        livePrice: commodityPriceCache[ticker] && commodityPriceCache[ticker].price,
-        livePriceTimestamp: commodityPriceCache[ticker] && commodityPriceCache[ticker].lastUpdated,
-        extendedHoursIncluded: true,
-        indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" }
-      });
-    }
-
+  } catch (error) {
+    console.warn(`[COMMODITY] ${ticker} ${interval} candles failed: ${error.message}`);
     return res.json({
       ticker,
       interval,
       commodity: true,
-      error: "No commodity candle provider returned usable data.",
-      twelveDataError: twelveError && twelveError.message,
-      yahooError: yahooError.message
+      error: "Commodity chart provider did not return usable data.",
+      providerError: error.message
     });
   }
 });
@@ -5774,11 +5761,13 @@ async function start() {
 
   connectFinnhub();
 
-  // Commodity prices use Twelve Data's official commodity stream when available,
-  // with official REST and Yahoo futures fallbacks.
-  connectCommodityTickerStream();
+  // Commodity quotes and charts use the same Yahoo futures instruments so the
+  // displayed price and every timeframe remain aligned.
   refreshCommodityQuotes(true)
-    .then(() => console.log(`[COMMODITY] Startup cache ready: ${Object.keys(commodityPriceCache).length}/${COMMODITY_TICKERS.length}`))
+    .then(() => {
+      console.log(`[COMMODITY] Startup quote cache ready: ${Object.keys(commodityPriceCache).length}/${COMMODITY_TICKERS.length}`);
+      COMMODITY_TICKERS.forEach(ticker => queueCommodityTickerCandleWarmup(ticker, null));
+    })
     .catch(error => console.warn(`[COMMODITY] Startup refresh failed: ${error.message}`));
 
   // Crypto prices use a one-second Binance ticker stream, with Binance REST,
