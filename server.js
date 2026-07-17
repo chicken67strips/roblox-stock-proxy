@@ -2309,11 +2309,43 @@ const COINGECKO_IDS = {
   LTC: "litecoin"
 };
 
-const cryptoPriceCache = {};
+const CRYPTO_LIVE_PAIRS = {
+  BTC: "BTCUSDT",
+  ETH: "ETHUSDT",
+  SOL: "SOLUSDT",
+  DOGE: "DOGEUSDT",
+  LTC: "LTCUSDT"
+};
 
+const CRYPTO_PAIR_TO_SYMBOL = Object.fromEntries(
+  Object.entries(CRYPTO_LIVE_PAIRS).map(([symbol, pair]) => [pair, symbol])
+);
+
+const cryptoPriceCache = {};
 let cryptoCacheFetchedAt = 0;
 
-const CRYPTO_CACHE_TTL_MS = 4500;
+// Binance ticker streams publish at 1000ms. REST is only a startup/watchdog fallback.
+const CRYPTO_CACHE_TTL_MS = 1500;
+const CRYPTO_STREAM_STALE_MS = 5500;
+const CRYPTO_REST_WATCHDOG_MS = 10000;
+
+let cryptoTickerWs = null;
+let cryptoTickerWsSourceIndex = 0;
+let cryptoTickerWsLastMessageAt = 0;
+let cryptoTickerWsReconnectTimer = null;
+let cryptoTickerWatchdog = null;
+let cryptoRestRefreshInProgress = false;
+
+const CRYPTO_STREAM_SOURCES = [
+  {
+    name: "Binance global WebSocket",
+    base: "wss://stream.binance.com:9443"
+  },
+  {
+    name: "Binance.US WebSocket",
+    base: "wss://stream.binance.us:9443"
+  }
+];
 
 function toNumber(value) {
   if (value === null || value === undefined) return null;
@@ -2559,6 +2591,7 @@ function normalizeCryptoPriceFromPayload(payload, symbol, sourceName, allowGener
 
   if (price === null || price <= 0) return null;
 
+  const nowMs = Date.now();
   return {
     symbol: normalizedSymbol,
     name:
@@ -2571,7 +2604,9 @@ function normalizeCryptoPriceFromPayload(payload, symbol, sourceName, allowGener
     change24h: findNumberDeep(obj, CHANGE_KEYS),
     marketCap: findNumberDeep(obj, MARKET_CAP_KEYS),
     volume24h: findNumberDeep(obj, VOLUME_KEYS),
-    lastUpdated: Math.floor(Date.now() / 1000),
+    lastUpdated: Math.floor(nowMs / 1000),
+    lastUpdatedMs: nowMs,
+    receivedAtMs: nowMs,
     source: sourceName
   };
 }
@@ -2591,6 +2626,160 @@ function normalizeManyCryptoPrices(payload, symbols, sourceName) {
   }
 
   return out;
+}
+
+function normalizeBinanceTickerRow(row, sourceName) {
+  if (!row || typeof row !== "object") return null;
+
+  const pair = normalizeSymbol(row.s || row.symbol);
+  const symbol = CRYPTO_PAIR_TO_SYMBOL[pair];
+  if (!symbol) return null;
+
+  const price = toNumber(row.c ?? row.lastPrice ?? row.price);
+  if (price === null || price <= 0) return null;
+
+  const eventMs = toNumber(row.E ?? row.closeTime) || Date.now();
+  const existing = cryptoPriceCache[symbol] || {};
+
+  return {
+    symbol,
+    name: CRYPTO_NAMES[symbol] || symbol,
+    price,
+    change24h: toNumber(row.P ?? row.priceChangePercent) ?? existing.change24h ?? null,
+    marketCap: existing.marketCap ?? null,
+    volume24h: toNumber(row.q ?? row.quoteVolume) ?? existing.volume24h ?? null,
+    lastUpdated: Math.floor(eventMs / 1000),
+    lastUpdatedMs: eventMs,
+    receivedAtMs: Date.now(),
+    source: sourceName
+  };
+}
+
+function applyBinanceTickerRow(row, sourceName) {
+  const info = normalizeBinanceTickerRow(row, sourceName);
+  if (!info) return false;
+
+  cryptoPriceCache[info.symbol] = info;
+  cryptoCacheFetchedAt = Date.now();
+  return true;
+}
+
+function cryptoStreamUrl(source) {
+  const streams = Object.values(CRYPTO_LIVE_PAIRS)
+    .map(pair => `${pair.toLowerCase()}@ticker`)
+    .join("/");
+  return `${source.base}/stream?streams=${streams}`;
+}
+
+function scheduleCryptoTickerReconnect(delayMs = 2000) {
+  if (cryptoTickerWsReconnectTimer) return;
+
+  cryptoTickerWsReconnectTimer = setTimeout(() => {
+    cryptoTickerWsReconnectTimer = null;
+    cryptoTickerWsSourceIndex = (cryptoTickerWsSourceIndex + 1) % CRYPTO_STREAM_SOURCES.length;
+    connectCryptoTickerStream();
+  }, delayMs);
+}
+
+function connectCryptoTickerStream() {
+  const source = CRYPTO_STREAM_SOURCES[cryptoTickerWsSourceIndex];
+
+  if (cryptoTickerWs) {
+    try {
+      cryptoTickerWs.removeAllListeners();
+      cryptoTickerWs.terminate();
+    } catch (_) {}
+    cryptoTickerWs = null;
+  }
+
+  const ws = new WebSocket(cryptoStreamUrl(source));
+  cryptoTickerWs = ws;
+
+  ws.on("open", () => {
+    cryptoTickerWsLastMessageAt = Date.now();
+    console.log(`[CRYPTO WS] Connected to ${source.name}`);
+  });
+
+  ws.on("message", raw => {
+    try {
+      const parsed = JSON.parse(String(raw));
+      const row = parsed && parsed.data ? parsed.data : parsed;
+      if (applyBinanceTickerRow(row, source.name)) {
+        cryptoTickerWsLastMessageAt = Date.now();
+      }
+    } catch (e) {
+      console.warn(`[CRYPTO WS] Bad message from ${source.name}: ${e.message}`);
+    }
+  });
+
+  ws.on("error", err => {
+    console.warn(`[CRYPTO WS] ${source.name} error: ${err.message}`);
+  });
+
+  ws.on("close", () => {
+    if (cryptoTickerWs === ws) cryptoTickerWs = null;
+    console.warn(`[CRYPTO WS] Disconnected from ${source.name}; switching/retrying.`);
+    scheduleCryptoTickerReconnect(2000);
+  });
+}
+
+function isCryptoStreamHealthy() {
+  return Boolean(
+    cryptoTickerWs &&
+    cryptoTickerWs.readyState === WebSocket.OPEN &&
+    Date.now() - cryptoTickerWsLastMessageAt <= CRYPTO_STREAM_STALE_MS
+  );
+}
+
+async function fetchBinanceRestPrices(symbols, baseUrl, sourceName) {
+  const requested = symbols.filter(symbol => CRYPTO_LIVE_PAIRS[symbol]);
+  if (requested.length === 0) return { prices: {} };
+
+  const pairs = requested.map(symbol => CRYPTO_LIVE_PAIRS[symbol]);
+  const prices = {};
+  let lastError = null;
+
+  const parseRows = data => {
+    const rows = Array.isArray(data) ? data : [data];
+    for (const row of rows) {
+      const info = normalizeBinanceTickerRow(row, sourceName);
+      if (info && requested.includes(info.symbol)) {
+        prices[info.symbol] = info;
+      }
+    }
+  };
+
+  try {
+    const url = `${baseUrl}/api/v3/ticker/24hr?symbols=${encodeURIComponent(JSON.stringify(pairs))}`;
+    const resp = await fetchJsonWithTimeout(url, { headers: { Accept: "application/json" } }, 7000);
+    if (resp.ok) {
+      parseRows(resp.data);
+    } else {
+      lastError = `${sourceName} HTTP ${resp.status}`;
+    }
+  } catch (e) {
+    lastError = e.message || `${sourceName} batch request failed.`;
+  }
+
+  // Some regional deployments do not accept the symbols array. Fill any missing
+  // assets with inexpensive individual requests rather than returning a partial set.
+  for (const symbol of requested) {
+    if (prices[symbol]) continue;
+    const pair = CRYPTO_LIVE_PAIRS[symbol];
+    try {
+      const url = `${baseUrl}/api/v3/ticker/24hr?symbol=${encodeURIComponent(pair)}`;
+      const resp = await fetchJsonWithTimeout(url, { headers: { Accept: "application/json" } }, 5000);
+      if (resp.ok) {
+        parseRows(resp.data);
+      } else {
+        lastError = `${sourceName} ${symbol} HTTP ${resp.status}`;
+      }
+    } catch (e) {
+      lastError = e.message || `${sourceName} ${symbol} request failed.`;
+    }
+  }
+
+  return { prices, error: lastError };
 }
 
 async function fetchFreeCryptoAPI(symbols) {
@@ -2618,7 +2807,7 @@ async function fetchFreeCryptoAPI(symbols) {
     if (batch.ok) {
       Object.assign(
         prices,
-        normalizeManyCryptoPrices(batch.data, symbols, "FreeCryptoAPI")
+        normalizeManyCryptoPrices(batch.data, symbols, "FreeCryptoAPI fallback")
       );
     } else {
       lastError =
@@ -2649,7 +2838,7 @@ async function fetchFreeCryptoAPI(symbols) {
       const info = normalizeCryptoPriceFromPayload(
         single.data,
         symbol,
-        "FreeCryptoAPI"
+        "FreeCryptoAPI fallback"
       );
 
       if (info) prices[symbol] = info;
@@ -2711,6 +2900,7 @@ async function fetchCoinGeckoFallback(symbols) {
 
       if (price === null || price <= 0) continue;
 
+      const nowMs = Date.now();
       prices[symbol] = {
         symbol,
         name: CRYPTO_NAMES[symbol] || symbol,
@@ -2718,7 +2908,9 @@ async function fetchCoinGeckoFallback(symbols) {
         change24h: toNumber(row.usd_24h_change),
         marketCap: toNumber(row.usd_market_cap),
         volume24h: toNumber(row.usd_24h_vol),
-        lastUpdated: Math.floor(Date.now() / 1000),
+        lastUpdated: Math.floor(nowMs / 1000),
+        lastUpdatedMs: nowMs,
+        receivedAtMs: nowMs,
         source: "CoinGecko fallback"
       };
     }
@@ -2734,71 +2926,151 @@ async function fetchCoinGeckoFallback(symbols) {
   }
 }
 
-async function fetchCryptoPrices(symbols = CRYPTO_SYMBOLS) {
-  const requestedSymbols = symbols
-    .map(normalizeSymbol)
-    .filter(symbol => CRYPTO_SYMBOLS.includes(symbol));
+function buildCryptoPriceResponse(requestedSymbols, extra = {}) {
+  const prices = {};
+  let newestReceivedAt = 0;
 
-  const now = Date.now();
-
-  const cacheHasAllRequested = requestedSymbols.every(symbol => {
-    return cryptoPriceCache[symbol];
-  });
-
-  if (
-    cacheHasAllRequested &&
-    now - cryptoCacheFetchedAt < CRYPTO_CACHE_TTL_MS
-  ) {
-    return {
-      prices: cryptoPriceCache,
-      cached: true
-    };
+  for (const symbol of requestedSymbols) {
+    const info = cryptoPriceCache[symbol];
+    if (!info) continue;
+    prices[symbol] = info;
+    newestReceivedAt = Math.max(newestReceivedAt, Number(info.receivedAtMs) || 0);
   }
-
-  const freeCrypto = await fetchFreeCryptoAPI(requestedSymbols);
-
-  let normalized = {
-    ...freeCrypto.prices
-  };
-
-  let providerError = freeCrypto.error || null;
-
-  const missing = requestedSymbols.filter(symbol => {
-    return !normalized[symbol];
-  });
-
-  if (missing.length > 0) {
-    const fallback = await fetchCoinGeckoFallback(missing);
-
-    Object.assign(normalized, fallback.prices);
-
-    if (fallback.error && Object.keys(normalized).length === 0) {
-      providerError = providerError
-        ? `${providerError}; ${fallback.error}`
-        : fallback.error;
-    }
-  }
-
-  if (Object.keys(normalized).length === 0) {
-    return {
-      error:
-        providerError ||
-        "No usable crypto prices returned by FreeCryptoAPI or fallback provider."
-    };
-  }
-
-  for (const [symbol, info] of Object.entries(normalized)) {
-    cryptoPriceCache[symbol] = info;
-  }
-
-  cryptoCacheFetchedAt = now;
 
   return {
-    prices: cryptoPriceCache,
-    cached: false,
-    providerError
+    prices,
+    cached: extra.cached === true,
+    streamHealthy: isCryptoStreamHealthy(),
+    serverTimeMs: Date.now(),
+    newestPriceAgeMs: newestReceivedAt > 0 ? Math.max(0, Date.now() - newestReceivedAt) : null,
+    stale: extra.stale === true,
+    providerError: extra.providerError || null
   };
 }
+
+async function fetchCryptoPrices(symbols = CRYPTO_SYMBOLS, options = {}) {
+  const requestedSymbols = [...new Set(
+    symbols
+      .map(normalizeSymbol)
+      .filter(symbol => CRYPTO_SYMBOLS.includes(symbol))
+  )];
+
+  const wanted = requestedSymbols.length > 0 ? requestedSymbols : CRYPTO_SYMBOLS;
+  const now = Date.now();
+
+  const cacheHasAllRequested = wanted.every(symbol => {
+    const info = cryptoPriceCache[symbol];
+    return info && toNumber(info.price) > 0;
+  });
+
+  const cacheIsFresh = wanted.every(symbol => {
+    const info = cryptoPriceCache[symbol];
+    const receivedAt = info && Number(info.receivedAtMs);
+    return receivedAt > 0 && now - receivedAt <= CRYPTO_STREAM_STALE_MS;
+  });
+
+  if (!options.forceRest && cacheHasAllRequested && cacheIsFresh) {
+    return buildCryptoPriceResponse(wanted, { cached: true });
+  }
+
+  if (cryptoRestRefreshInProgress && cacheHasAllRequested) {
+    return buildCryptoPriceResponse(wanted, {
+      cached: true,
+      stale: !cacheIsFresh
+    });
+  }
+
+  cryptoRestRefreshInProgress = true;
+  let providerError = null;
+
+  try {
+    let missing = wanted.filter(symbol => !cryptoPriceCache[symbol] || !cacheIsFresh);
+
+    const globalResult = await fetchBinanceRestPrices(
+      missing,
+      "https://api.binance.com",
+      "Binance global REST"
+    );
+    Object.assign(cryptoPriceCache, globalResult.prices);
+    providerError = globalResult.error || providerError;
+
+    missing = wanted.filter(symbol => !cryptoPriceCache[symbol] || (Date.now() - (cryptoPriceCache[symbol].receivedAtMs || 0)) > CRYPTO_STREAM_STALE_MS);
+    if (missing.length > 0) {
+      const usResult = await fetchBinanceRestPrices(
+        missing,
+        "https://api.binance.us",
+        "Binance.US REST"
+      );
+      Object.assign(cryptoPriceCache, usResult.prices);
+      providerError = usResult.error || providerError;
+    }
+
+    missing = wanted.filter(symbol => !cryptoPriceCache[symbol]);
+    if (missing.length > 0) {
+      const freeCrypto = await fetchFreeCryptoAPI(missing);
+      Object.assign(cryptoPriceCache, freeCrypto.prices);
+      providerError = freeCrypto.error || providerError;
+    }
+
+    missing = wanted.filter(symbol => !cryptoPriceCache[symbol]);
+    if (missing.length > 0) {
+      const fallback = await fetchCoinGeckoFallback(missing);
+      Object.assign(cryptoPriceCache, fallback.prices);
+      providerError = fallback.error || providerError;
+    }
+
+    cryptoCacheFetchedAt = Date.now();
+  } finally {
+    cryptoRestRefreshInProgress = false;
+  }
+
+  const finalHasAny = wanted.some(symbol => cryptoPriceCache[symbol]);
+  if (!finalHasAny) {
+    return {
+      prices: {},
+      error: providerError || "No usable real crypto prices were returned.",
+      streamHealthy: isCryptoStreamHealthy(),
+      serverTimeMs: Date.now(),
+      stale: true
+    };
+  }
+
+  const stale = wanted.some(symbol => {
+    const info = cryptoPriceCache[symbol];
+    return !info || Date.now() - (Number(info.receivedAtMs) || 0) > CRYPTO_REST_WATCHDOG_MS;
+  });
+
+  return buildCryptoPriceResponse(wanted, {
+    cached: false,
+    stale,
+    providerError
+  });
+}
+
+function startCryptoPriceWatchdog() {
+  if (cryptoTickerWatchdog) return;
+
+  cryptoTickerWatchdog = setInterval(() => {
+    const stale = Date.now() - cryptoTickerWsLastMessageAt > CRYPTO_STREAM_STALE_MS;
+
+    if (!cryptoTickerWs || cryptoTickerWs.readyState !== WebSocket.OPEN || stale) {
+      if (cryptoTickerWs) {
+        try {
+          cryptoTickerWs.terminate();
+        } catch (_) {}
+      } else {
+        scheduleCryptoTickerReconnect(500);
+      }
+    }
+
+    if (stale) {
+      fetchCryptoPrices(CRYPTO_SYMBOLS, { forceRest: true }).catch(err => {
+        console.warn(`[CRYPTO REST] Watchdog refresh failed: ${err.message}`);
+      });
+    }
+  }, 3000);
+}
+
 
 // ============================
 // Crypto candles - free Binance public klines
@@ -4194,6 +4466,10 @@ app.get("/market/status", (req, res) => {
 });
 
 app.get("/crypto/prices", async (req, res) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+
   const rawSymbols = String(req.query.symbols || "BTC,ETH,SOL,DOGE,LTC")
     .toUpperCase()
     .replace(/\s+/g, "")
@@ -4224,46 +4500,31 @@ app.get("/crypto/candles", async (req, res) => {
 });
 
 app.get("/crypto/debug", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+
   const symbol = normalizeSymbol(req.query.symbol || "BTC");
-
   if (!CRYPTO_SYMBOLS.includes(symbol)) {
-    return res.json({
-      error: "Unsupported debug symbol."
-    });
+    return res.json({ error: "Unsupported debug symbol." });
   }
 
-  if (!FREECRYPTO_API_KEY) {
-    return res.json({
-      freeCryptoApiKeyPresent: false,
-      error: "FREECRYPTO_API_KEY is not set."
-    });
-  }
-
-  const url = `${FREECRYPTO_BASE_URL}/getData?symbol=${encodeURIComponent(symbol)}`;
-
-  const raw = await fetchJsonWithTimeout(url, {
-    headers: {
-      Authorization: `Bearer ${FREECRYPTO_API_KEY}`,
-      Accept: "application/json"
-    }
-  }).catch(e => ({
-    ok: false,
-    status: 0,
-    data: {
-      error: e.message
-    }
-  }));
+  const result = await fetchCryptoPrices([symbol]);
+  const info = result.prices && result.prices[symbol];
 
   res.json({
-    freeCryptoApiKeyPresent: true,
-    status: raw.status,
-    ok: raw.ok,
-    normalized: normalizeCryptoPriceFromPayload(
-      raw.data,
-      symbol,
-      "FreeCryptoAPI"
-    ),
-    raw: raw.data
+    symbol,
+    price: info && info.price,
+    change24h: info && info.change24h,
+    source: info && info.source,
+    providerTimestamp: info && info.lastUpdated,
+    receivedAtMs: info && info.receivedAtMs,
+    ageMs: info && info.receivedAtMs ? Math.max(0, Date.now() - info.receivedAtMs) : null,
+    streamHealthy: isCryptoStreamHealthy(),
+    websocketReadyState: cryptoTickerWs ? cryptoTickerWs.readyState : null,
+    websocketSource: CRYPTO_STREAM_SOURCES[cryptoTickerWsSourceIndex].name,
+    websocketLastMessageAgeMs: cryptoTickerWsLastMessageAt > 0 ? Math.max(0, Date.now() - cryptoTickerWsLastMessageAt) : null,
+    cacheSymbols: Object.keys(cryptoPriceCache),
+    stale: result.stale === true,
+    providerError: result.providerError || null
   });
 });
 
@@ -4318,6 +4579,542 @@ app.get("/news", async (req, res) => {
 app.get("/news/all", async (req, res) => {
   const result = await fetchAllMarketNews();
   res.json(result);
+});
+
+
+// ============================
+// Commodity market data
+// ============================
+// Twelve Data is the primary provider because it has an official commodities API
+// with real-time quotes and intraday/history on the free tier. Yahoo commodity
+// futures are kept as a no-key fallback so the game remains usable if the free
+// Twelve Data allowance is exhausted or a specific commodity is not enabled.
+const COMMODITY_DEFINITIONS = {
+  GOLD: {
+    name: "Gold",
+    unit: "troy ounce",
+    twelveCandidates: ["XAU/USD"],
+    yahooSymbol: "GC=F"
+  },
+  SILVER: {
+    name: "Silver",
+    unit: "troy ounce",
+    twelveCandidates: ["XAG/USD"],
+    yahooSymbol: "SI=F"
+  },
+  OIL: {
+    name: "WTI Crude Oil",
+    unit: "barrel",
+    twelveCandidates: ["WTI/USD", "XTI/USD", "WTI"],
+    yahooSymbol: "CL=F"
+  }
+};
+
+const COMMODITY_TICKERS = Object.keys(COMMODITY_DEFINITIONS);
+const commodityPriceCache = {};
+const commodityResolvedTwelveSymbol = {};
+let commodityRefreshInProgress = null;
+let commodityLastTwelveRestRefreshAt = 0;
+let commodityWs = null;
+let commodityWsLastMessageAt = 0;
+let commodityWsReconnectTimer = null;
+let commodityWsHeartbeatTimer = null;
+
+const COMMODITY_QUOTE_FRESH_MS = 15 * 1000;
+const COMMODITY_TWELVE_REST_INTERVAL_MS = 60 * 1000;
+const COMMODITY_WS_STALE_MS = 20 * 1000;
+
+function normalizeCommodityTicker(value) {
+  return String(value || "").trim().toUpperCase();
+}
+
+function isCommodityTicker(value) {
+  return Boolean(COMMODITY_DEFINITIONS[normalizeCommodityTicker(value)]);
+}
+
+function commodityDisplayTickerForProviderSymbol(symbol) {
+  const normalized = String(symbol || "").trim().toUpperCase();
+  for (const [displayTicker, definition] of Object.entries(COMMODITY_DEFINITIONS)) {
+    if (definition.twelveCandidates.some(candidate => candidate.toUpperCase() === normalized)) {
+      return displayTicker;
+    }
+  }
+  return null;
+}
+
+function commodityRowIsFresh(row, maxAgeMs = COMMODITY_QUOTE_FRESH_MS) {
+  return Boolean(row && Number(row.price) > 0 && Date.now() - Number(row.receivedAtMs || 0) <= maxAgeMs);
+}
+
+function updateCommodityPrice(displayTicker, payload) {
+  displayTicker = normalizeCommodityTicker(displayTicker);
+  const definition = COMMODITY_DEFINITIONS[displayTicker];
+  if (!definition) return false;
+
+  const price = toNumber(payload && payload.price);
+  if (price === null || price <= 0) return false;
+
+  const existing = commodityPriceCache[displayTicker] || {};
+  const prevClose = toNumber(payload.prevClose) ?? toNumber(existing.prevClose) ?? price;
+  const suppliedChange = toNumber(payload.changePct);
+  const changePct = suppliedChange !== null
+    ? suppliedChange
+    : (prevClose > 0 ? ((price - prevClose) / prevClose) * 100 : 0);
+  const lastUpdated = Number(payload.lastUpdated) > 0
+    ? Number(payload.lastUpdated)
+    : Math.floor(Date.now() / 1000);
+
+  commodityPriceCache[displayTicker] = {
+    ticker: displayTicker,
+    name: definition.name,
+    unit: definition.unit,
+    assetType: "commodity",
+    price,
+    prevClose,
+    changePct: Number(changePct.toFixed(4)),
+    lastUpdated,
+    fetchedAt: Date.now(),
+    receivedAtMs: Date.now(),
+    source: String(payload.source || existing.source || "Commodity market data"),
+    providerSymbol: payload.providerSymbol || existing.providerSymbol || null
+  };
+
+  return true;
+}
+
+async function fetchTwelveDataCommodityQuote(displayTicker) {
+  if (!TWELVE_DATA_API_KEY) throw new Error("TWELVE_DATA_API_KEY is not configured.");
+
+  const definition = COMMODITY_DEFINITIONS[displayTicker];
+  if (!definition) throw new Error("Unknown commodity ticker.");
+
+  const resolved = commodityResolvedTwelveSymbol[displayTicker];
+  const candidates = resolved
+    ? [resolved, ...definition.twelveCandidates.filter(symbol => symbol !== resolved)]
+    : definition.twelveCandidates;
+
+  let lastError = null;
+  for (const providerSymbol of candidates) {
+    try {
+      const url =
+        `https://api.twelvedata.com/quote?symbol=${encodeURIComponent(providerSymbol)}` +
+        `&timezone=UTC&apikey=${encodeURIComponent(TWELVE_DATA_API_KEY)}`;
+      const data = await tdRequest(url, TD_PRIORITY.quote);
+      if (!data || data.status === "error") {
+        throw new Error(data && data.message ? data.message : "No Twelve Data commodity quote.");
+      }
+
+      const price = toNumber(data.close) ?? toNumber(data.price);
+      if (price === null || price <= 0) throw new Error("Twelve Data quote had no usable price.");
+
+      const prevClose = toNumber(data.previous_close) ?? price;
+      const percentChange = toNumber(data.percent_change);
+      commodityResolvedTwelveSymbol[displayTicker] = providerSymbol;
+      updateCommodityPrice(displayTicker, {
+        price,
+        prevClose,
+        changePct: percentChange,
+        lastUpdated: Number(data.timestamp) || Math.floor(Date.now() / 1000),
+        source: "Twelve Data commodities",
+        providerSymbol
+      });
+      return commodityPriceCache[displayTicker];
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error("No Twelve Data commodity symbol returned data.");
+}
+
+async function fetchYahooCommodityQuote(displayTicker) {
+  const definition = COMMODITY_DEFINITIONS[displayTicker];
+  if (!definition) throw new Error("Unknown commodity ticker.");
+
+  const url =
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(definition.yahooSymbol)}` +
+    `?range=5d&interval=1m&includePrePost=true`;
+  const response = await fetchJsonWithTimeout(
+    url,
+    { headers: { Accept: "application/json", "User-Agent": "Mozilla/5.0" } },
+    12000
+  );
+
+  if (!response.ok) throw new Error(`Yahoo commodity HTTP ${response.status}`);
+  const chart = response.data && response.data.chart;
+  const result = chart && Array.isArray(chart.result) && chart.result[0];
+  if (!result) throw new Error(chart?.error?.description || "No Yahoo commodity quote result.");
+
+  const meta = result.meta || {};
+  const timestamps = Array.isArray(result.timestamp) ? result.timestamp : [];
+  const quote = result.indicators && result.indicators.quote && result.indicators.quote[0];
+  const closes = quote && Array.isArray(quote.close) ? quote.close : [];
+
+  let latestPrice = toNumber(meta.regularMarketPrice);
+  let latestTimestamp = Number(meta.regularMarketTime) || 0;
+  for (let index = closes.length - 1; index >= 0; index--) {
+    const candidate = toNumber(closes[index]);
+    if (candidate !== null && candidate > 0) {
+      latestPrice = candidate;
+      latestTimestamp = Number(timestamps[index]) || latestTimestamp;
+      break;
+    }
+  }
+
+  if (latestPrice === null || latestPrice <= 0) throw new Error("Yahoo commodity quote had no usable price.");
+  const prevClose = toNumber(meta.chartPreviousClose) ?? toNumber(meta.previousClose) ?? latestPrice;
+
+  updateCommodityPrice(displayTicker, {
+    price: latestPrice,
+    prevClose,
+    lastUpdated: latestTimestamp || Math.floor(Date.now() / 1000),
+    source: "Yahoo Finance commodity futures fallback",
+    providerSymbol: definition.yahooSymbol
+  });
+  return commodityPriceCache[displayTicker];
+}
+
+async function refreshCommodityQuotes(force = false) {
+  if (commodityRefreshInProgress) return commodityRefreshInProgress;
+
+  const allFresh = COMMODITY_TICKERS.every(ticker => commodityRowIsFresh(commodityPriceCache[ticker]));
+  if (!force && allFresh) return commodityPriceCache;
+
+  commodityRefreshInProgress = (async () => {
+    const websocketHealthy = commodityWsLastMessageAt > 0 && Date.now() - commodityWsLastMessageAt <= COMMODITY_WS_STALE_MS;
+    const shouldRefreshTwelve = Boolean(
+      TWELVE_DATA_API_KEY &&
+      (force || Date.now() - commodityLastTwelveRestRefreshAt >= COMMODITY_TWELVE_REST_INTERVAL_MS)
+    );
+
+    if (shouldRefreshTwelve) {
+      commodityLastTwelveRestRefreshAt = Date.now();
+      const results = await Promise.allSettled(COMMODITY_TICKERS.map(fetchTwelveDataCommodityQuote));
+      results.forEach((result, index) => {
+        if (result.status === "rejected") {
+          console.warn(`[COMMODITY] Twelve Data ${COMMODITY_TICKERS[index]} quote failed: ${result.reason?.message || result.reason}`);
+        }
+      });
+    }
+
+    // When the official stream is unavailable, use the no-key futures feed so
+    // prices continue moving instead of waiting a full minute between REST calls.
+    if (!websocketHealthy) {
+      const fallbackTickers = COMMODITY_TICKERS.filter(ticker => !commodityRowIsFresh(commodityPriceCache[ticker]));
+      const results = await Promise.allSettled(fallbackTickers.map(fetchYahooCommodityQuote));
+      results.forEach((result, index) => {
+        if (result.status === "rejected") {
+          console.warn(`[COMMODITY] Yahoo ${fallbackTickers[index]} quote failed: ${result.reason?.message || result.reason}`);
+        }
+      });
+    }
+
+    return commodityPriceCache;
+  })().finally(() => {
+    commodityRefreshInProgress = null;
+  });
+
+  return commodityRefreshInProgress;
+}
+
+function connectCommodityTickerStream() {
+  if (!TWELVE_DATA_API_KEY) {
+    console.log("[COMMODITY] Twelve Data WebSocket disabled: TWELVE_DATA_API_KEY is not set.");
+    return;
+  }
+
+  if (commodityWsReconnectTimer) {
+    clearTimeout(commodityWsReconnectTimer);
+    commodityWsReconnectTimer = null;
+  }
+  if (commodityWsHeartbeatTimer) {
+    clearInterval(commodityWsHeartbeatTimer);
+    commodityWsHeartbeatTimer = null;
+  }
+  if (commodityWs) {
+    try { commodityWs.removeAllListeners(); commodityWs.terminate(); } catch (_) {}
+    commodityWs = null;
+  }
+
+  const url = `wss://ws.twelvedata.com/v1/quotes/price?apikey=${encodeURIComponent(TWELVE_DATA_API_KEY)}`;
+  const socket = new WebSocket(url);
+  commodityWs = socket;
+
+  socket.on("open", () => {
+    const symbols = [...new Set(Object.values(COMMODITY_DEFINITIONS).flatMap(definition => definition.twelveCandidates))];
+    socket.send(JSON.stringify({ action: "subscribe", params: { symbols: symbols.join(",") } }));
+    commodityWsHeartbeatTimer = setInterval(() => {
+      if (socket.readyState === WebSocket.OPEN) {
+        try { socket.send(JSON.stringify({ action: "heartbeat" })); } catch (_) {}
+      }
+    }, 10000);
+    console.log(`[COMMODITY] Twelve Data stream subscribed to ${symbols.join(", ")}`);
+  });
+
+  socket.on("message", raw => {
+    let decoded;
+    try { decoded = JSON.parse(String(raw)); } catch (_) { return; }
+    const events = Array.isArray(decoded) ? decoded : [decoded];
+
+    for (const event of events) {
+      if (!event || toNumber(event.price) === null) continue;
+      const displayTicker = commodityDisplayTickerForProviderSymbol(event.symbol);
+      if (!displayTicker) continue;
+
+      const currentResolved = commodityResolvedTwelveSymbol[displayTicker];
+      if (currentResolved && String(currentResolved).toUpperCase() !== String(event.symbol).toUpperCase()) continue;
+      if (!currentResolved) {
+        // OIL has several provider aliases. Accept whichever valid candidate begins
+        // streaming first, then lock this display ticker to that provider symbol.
+        commodityResolvedTwelveSymbol[displayTicker] = event.symbol;
+      }
+
+      commodityWsLastMessageAt = Date.now();
+      updateCommodityPrice(displayTicker, {
+        price: event.price,
+        lastUpdated: Number(event.timestamp) || Math.floor(Date.now() / 1000),
+        source: "Twelve Data commodities WebSocket",
+        providerSymbol: event.symbol
+      });
+    }
+  });
+
+  const scheduleReconnect = () => {
+    if (commodityWs === socket) commodityWs = null;
+    if (commodityWsHeartbeatTimer) {
+      clearInterval(commodityWsHeartbeatTimer);
+      commodityWsHeartbeatTimer = null;
+    }
+    if (!commodityWsReconnectTimer) {
+      commodityWsReconnectTimer = setTimeout(() => {
+        commodityWsReconnectTimer = null;
+        connectCommodityTickerStream();
+      }, 7000);
+    }
+  };
+
+  socket.on("close", scheduleReconnect);
+  socket.on("error", error => {
+    console.warn(`[COMMODITY] Twelve Data stream error: ${error.message}`);
+  });
+}
+
+function parseUtcCommodityTimestamp(datetime) {
+  if (!datetime) return null;
+  const normalized = String(datetime).trim().replace(" ", "T");
+  const timestamp = Date.parse(normalized.endsWith("Z") ? normalized : `${normalized}Z`);
+  return Number.isFinite(timestamp) ? Math.floor(timestamp / 1000) : null;
+}
+
+async function fetchTwelveDataCommodityCandles(displayTicker, interval, limit = 200) {
+  if (!TWELVE_DATA_API_KEY) throw new Error("TWELVE_DATA_API_KEY is not configured.");
+  const definition = COMMODITY_DEFINITIONS[displayTicker];
+  if (!definition) throw new Error("Unknown commodity ticker.");
+
+  const resolved = commodityResolvedTwelveSymbol[displayTicker];
+  const candidates = resolved
+    ? [resolved, ...definition.twelveCandidates.filter(symbol => symbol !== resolved)]
+    : definition.twelveCandidates;
+  let lastError = null;
+
+  for (const providerSymbol of candidates) {
+    try {
+      const url =
+        `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(providerSymbol)}` +
+        `&interval=${encodeURIComponent(interval)}&outputsize=${Math.max(20, Math.min(500, limit))}` +
+        `&timezone=UTC&apikey=${encodeURIComponent(TWELVE_DATA_API_KEY)}`;
+      const data = await tdRequest(url, TD_PRIORITY.candle);
+      if (!data || data.status === "error" || !Array.isArray(data.values)) {
+        throw new Error(data && data.message ? data.message : "No Twelve Data commodity candles.");
+      }
+
+      const candles = data.values
+        .slice()
+        .reverse()
+        .map(value => {
+          const o = toNumber(value.open);
+          const h = toNumber(value.high);
+          const l = toNumber(value.low);
+          const c = toNumber(value.close);
+          if (o === null || h === null || l === null || c === null || o <= 0 || h <= 0 || l <= 0 || c <= 0) return null;
+          const ts = Number(value.timestamp) || parseUtcCommodityTimestamp(value.datetime);
+          return {
+            t: ts ? formatSyntheticStockCandleTime(ts * 1000, interval) : String(value.datetime || ""),
+            ts: ts || undefined,
+            session: "commodity",
+            o: roundCandleNumber(o),
+            h: roundCandleNumber(h),
+            l: roundCandleNumber(l),
+            c: roundCandleNumber(c),
+            v: toNumber(value.volume) || 0
+          };
+        })
+        .filter(Boolean)
+        .slice(-limit);
+
+      if (candles.length === 0) throw new Error("Twelve Data returned no usable commodity candles.");
+      commodityResolvedTwelveSymbol[displayTicker] = providerSymbol;
+      setCachedCandles(displayTicker, interval, candles, "Twelve Data commodities");
+      return candles;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error("No Twelve Data commodity candle symbol returned data.");
+}
+
+async function fetchYahooCommodityCandles(displayTicker, interval, limit = 200) {
+  const definition = COMMODITY_DEFINITIONS[displayTicker];
+  const cfg = YAHOO_INTERVALS[interval];
+  if (!definition) throw new Error("Unknown commodity ticker.");
+  if (!cfg) throw new Error("Unsupported commodity candle interval.");
+
+  const url =
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(definition.yahooSymbol)}` +
+    `?range=${encodeURIComponent(cfg.range)}&interval=${encodeURIComponent(cfg.interval)}&includePrePost=true`;
+  const response = await fetchJsonWithTimeout(
+    url,
+    { headers: { Accept: "application/json", "User-Agent": "Mozilla/5.0" } },
+    12000
+  );
+  if (!response.ok) throw new Error(`Yahoo commodity candle HTTP ${response.status}`);
+
+  const chart = response.data && response.data.chart;
+  const result = chart && Array.isArray(chart.result) && chart.result[0];
+  if (!result) throw new Error(chart?.error?.description || "No Yahoo commodity candle result.");
+  const timestamps = Array.isArray(result.timestamp) ? result.timestamp : [];
+  const quote = result.indicators && result.indicators.quote && result.indicators.quote[0];
+  if (!quote || timestamps.length === 0) throw new Error("Yahoo commodity candles were empty.");
+
+  const candles = [];
+  for (let index = 0; index < timestamps.length; index++) {
+    const o = toNumber(quote.open && quote.open[index]);
+    const h = toNumber(quote.high && quote.high[index]);
+    const l = toNumber(quote.low && quote.low[index]);
+    const c = toNumber(quote.close && quote.close[index]);
+    if (o === null || h === null || l === null || c === null || o <= 0 || h <= 0 || l <= 0 || c <= 0) continue;
+    const ts = Number(timestamps[index]);
+    candles.push({
+      t: formatSyntheticStockCandleTime(ts * 1000, interval),
+      ts,
+      session: "commodity",
+      o: roundCandleNumber(o),
+      h: roundCandleNumber(h),
+      l: roundCandleNumber(l),
+      c: roundCandleNumber(c),
+      v: toNumber(quote.volume && quote.volume[index]) || 0
+    });
+  }
+
+  if (candles.length === 0) throw new Error("Yahoo returned no usable commodity candles.");
+  const output = candles.slice(-limit);
+  setCachedCandles(displayTicker, interval, output, "Yahoo Finance commodity futures fallback");
+  return output;
+}
+
+app.get("/commodity/prices", async (req, res) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  const force = req.query.fresh === "1" || req.query.fresh === "true";
+  await refreshCommodityQuotes(force);
+  const prices = {};
+  for (const ticker of COMMODITY_TICKERS) {
+    if (commodityPriceCache[ticker]) prices[ticker] = commodityPriceCache[ticker];
+  }
+  res.json({
+    success: Object.keys(prices).length > 0,
+    prices,
+    source: commodityWsLastMessageAt > 0 && Date.now() - commodityWsLastMessageAt <= COMMODITY_WS_STALE_MS
+      ? "Twelve Data commodities WebSocket"
+      : "Twelve Data / Yahoo fallback",
+    updatedAt: Math.floor(Date.now() / 1000),
+    streamHealthy: commodityWsLastMessageAt > 0 && Date.now() - commodityWsLastMessageAt <= COMMODITY_WS_STALE_MS
+  });
+});
+
+app.get("/commodity/price", async (req, res) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  const ticker = normalizeCommodityTicker(req.query.ticker);
+  if (!isCommodityTicker(ticker)) return res.json({ error: "Unknown commodity ticker." });
+  await refreshCommodityQuotes(req.query.fresh === "1" || !commodityRowIsFresh(commodityPriceCache[ticker]));
+  res.json(commodityPriceCache[ticker] || { ticker, error: "No commodity price available." });
+});
+
+app.get("/commodity/candles", async (req, res) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  const ticker = normalizeCommodityTicker(req.query.ticker);
+  const requestedInterval = String(req.query.interval || "1m");
+  const intervalMap = { "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "1d": "1day" };
+  const interval = intervalMap[requestedInterval] || requestedInterval;
+  if (!isCommodityTicker(ticker)) return res.json({ ticker, error: "Unknown commodity ticker." });
+  if (!Object.values(intervalMap).includes(interval)) return res.json({ ticker, error: "Unsupported commodity interval." });
+
+  const cached = getCachedCandleEntry(ticker, interval);
+  if (cached && Array.isArray(cached.data) && cached.data.length > 0) {
+    return res.json({
+      ticker,
+      interval,
+      candles: withChartIndicators(cached.data),
+      cached: true,
+      commodity: true,
+      source: cached.source,
+      extendedHoursIncluded: true,
+      indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" }
+    });
+  }
+
+  let twelveError = null;
+  if (TWELVE_DATA_API_KEY) {
+    try {
+      const candles = await fetchTwelveDataCommodityCandles(ticker, interval, 200);
+      return res.json({
+        ticker,
+        interval,
+        candles: withChartIndicators(candles),
+        cached: false,
+        commodity: true,
+        source: "Twelve Data commodities",
+        extendedHoursIncluded: true,
+        indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" }
+      });
+    } catch (error) {
+      twelveError = error;
+    }
+  }
+
+  try {
+    const candles = await fetchYahooCommodityCandles(ticker, interval, 200);
+    return res.json({
+      ticker,
+      interval,
+      candles: withChartIndicators(candles),
+      cached: false,
+      commodity: true,
+      source: "Yahoo Finance commodity futures fallback",
+      extendedHoursIncluded: true,
+      indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" }
+    });
+  } catch (yahooError) {
+    return res.json({
+      ticker,
+      interval,
+      commodity: true,
+      error: "No commodity candle provider returned usable data.",
+      twelveDataError: twelveError && twelveError.message,
+      yahooError: yahooError.message
+    });
+  }
+});
+
+app.get("/commodity/debug", async (_req, res) => {
+  await refreshCommodityQuotes(false);
+  res.json({
+    tickers: COMMODITY_TICKERS,
+    prices: commodityPriceCache,
+    resolvedTwelveSymbols: commodityResolvedTwelveSymbol,
+    websocketReadyState: commodityWs ? commodityWs.readyState : null,
+    websocketLastMessageAgeMs: commodityWsLastMessageAt > 0 ? Date.now() - commodityWsLastMessageAt : null
+  });
 });
 
 app.get("/prices", async (req, res) => {
@@ -4629,6 +5426,22 @@ async function start() {
   }
 
   connectFinnhub();
+
+  // Commodity prices use Twelve Data's official commodity stream when available,
+  // with official REST and Yahoo futures fallbacks.
+  connectCommodityTickerStream();
+  refreshCommodityQuotes(true)
+    .then(() => console.log(`[COMMODITY] Startup cache ready: ${Object.keys(commodityPriceCache).length}/${COMMODITY_TICKERS.length}`))
+    .catch(error => console.warn(`[COMMODITY] Startup refresh failed: ${error.message}`));
+
+  // Crypto prices use a one-second Binance ticker stream, with Binance REST,
+  // FreeCryptoAPI and CoinGecko as automatic fallbacks.
+  connectCryptoTickerStream();
+  startCryptoPriceWatchdog();
+  fetchCryptoPrices(CRYPTO_SYMBOLS, { forceRest: true })
+    .then(result => console.log(`[CRYPTO] Startup cache ready: ${Object.keys(result.prices || {}).length}/${CRYPTO_SYMBOLS.length}`))
+    .catch(err => console.warn(`[CRYPTO] Startup refresh failed: ${err.message}`));
+
   startFinnhubRestPolling();
   startYahooQuotePolling();
 
