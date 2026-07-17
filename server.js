@@ -2296,127 +2296,137 @@ const STOCK_BAD_WICK_MIN_PERCENT = {
 };
 
 function repairIsolatedStockWicks(candles, interval) {
-  if (!Array.isArray(candles) || candles.length < 5 || interval === "1day") {
+  if (!Array.isArray(candles) || candles.length < 3 || interval === "1day") {
     return candles;
   }
 
   const intervalSeconds = STOCK_CANDLE_INTERVAL_SECONDS[interval] || 60;
-  const minimumPercent = STOCK_BAD_WICK_MIN_PERCENT[interval] || 0.004;
   const source = candles.map(candle => ({ ...candle }));
   const repaired = source.map(candle => ({ ...candle }));
 
-  for (let index = 0; index < source.length; index++) {
+  const validBar = candle => {
+    if (!candle) return false;
+    const values = [candle.o, candle.h, candle.l, candle.c].map(Number);
+    return values.every(value => Number.isFinite(value) && value > 0);
+  };
+
+  const sameSessionAndNearby = (left, right, maxIntervals = 2) => {
+    if (!left || !right) return false;
+    if (left.session && right.session && left.session !== right.session) return false;
+
+    const leftTs = Number(left.ts);
+    const rightTs = Number(right.ts);
+    if (Number.isFinite(leftTs) && Number.isFinite(rightTs)) {
+      return Math.abs(leftTs - rightTs) <= intervalSeconds * maxIntervals;
+    }
+
+    return true;
+  };
+
+  const repairOne = index => {
     const candle = source[index];
+    const previous = source[index - 1];
+    const next = source[index + 1];
+
+    if (!validBar(previous) || !validBar(candle) || !validBar(next)) return false;
+    if (!sameSessionAndNearby(previous, candle) || !sameSessionAndNearby(candle, next)) return false;
+
     const open = Number(candle.o);
     const high = Number(candle.h);
     const low = Number(candle.l);
     const close = Number(candle.c);
-    const timestamp = Number(candle.ts);
+    const previousClose = Number(previous.c);
+    const nextOpen = Number(next.o);
+    const nextClose = Number(next.c);
 
-    if (![open, high, low, close].every(Number.isFinite)) continue;
-    if (open <= 0 || high <= 0 || low <= 0 || close <= 0) continue;
+    const anchor = medianFinite([
+      previous.o,
+      previous.c,
+      next.o,
+      next.c
+    ]);
+    if (!Number.isFinite(anchor) || anchor <= 0) return false;
 
-    const neighborPrices = [];
-    const neighborMoves = [];
-    const neighborVolumes = [];
-    const neighborBodyValues = [];
-
-    for (let offset = -4; offset <= 4; offset++) {
-      if (offset === 0) continue;
-      const neighbor = source[index + offset];
-      if (!neighbor) continue;
-
-      const neighborTimestamp = Number(neighbor.ts);
-      if (
-        Number.isFinite(timestamp) &&
-        Number.isFinite(neighborTimestamp) &&
-        Math.abs(neighborTimestamp - timestamp) > intervalSeconds * 6
-      ) {
-        continue;
-      }
-
-      if (
-        candle.session &&
-        neighbor.session &&
-        candle.session !== neighbor.session
-      ) {
-        continue;
-      }
-
-      const neighborOpen = Number(neighbor.o);
-      const neighborClose = Number(neighbor.c);
-      if (!Number.isFinite(neighborOpen) || !Number.isFinite(neighborClose)) continue;
-      if (neighborOpen <= 0 || neighborClose <= 0) continue;
-
-      neighborPrices.push(neighborOpen, neighborClose);
-      neighborBodyValues.push(neighborOpen, neighborClose);
-      neighborMoves.push(Math.abs(neighborClose - neighborOpen));
-
-      const neighborVolume = Number(neighbor.v);
-      if (Number.isFinite(neighborVolume) && neighborVolume >= 0) {
-        neighborVolumes.push(neighborVolume);
-      }
-    }
-
-    if (neighborPrices.length < 6) continue;
-
-    const referencePrice = medianFinite(neighborPrices);
-    const typicalMove = medianFinite(neighborMoves);
-    const typicalVolume = medianFinite(neighborVolumes);
-    if (!Number.isFinite(referencePrice) || referencePrice <= 0) continue;
-
-    const bodyLow = Math.min(open, close);
-    const bodyHigh = Math.max(open, close);
-    const bodyRange = Math.abs(close - open);
-    const normalBand = Math.max(referencePrice * 0.00035, typicalMove * 3, 0.005);
-    const bodyNearBand = Math.max(referencePrice * 0.0018, typicalMove * 7, bodyRange * 5, 0.02);
-    const outlierThreshold = Math.max(
-      referencePrice * minimumPercent,
-      typicalMove * 12,
-      bodyRange * 10,
-      0.03
+    const previousRange = Math.max(0, Number(previous.h) - Number(previous.l));
+    const nextRange = Math.max(0, Number(next.h) - Number(next.l));
+    const neighborRange = Math.max(
+      previousRange,
+      nextRange,
+      Math.abs(previousClose - nextOpen),
+      Math.abs(previousClose - nextClose),
+      anchor * 0.00015,
+      0.01
     );
 
-    const bodyNearReference =
-      Math.abs(open - referencePrice) <= bodyNearBand &&
-      Math.abs(close - referencePrice) <= bodyNearBand;
-
-    const currentVolume = Number(candle.v);
-    const volumeLooksNormal =
-      !Number.isFinite(currentVolume) ||
-      currentVolume < 0 ||
-      typicalVolume <= 0 ||
-      currentVolume <= typicalVolume * 7 + 100;
-
-    if (!bodyNearReference || !volumeLooksNormal) continue;
-
-    let repairedLow = low;
-    let repairedHigh = high;
-
-    const lowWickDistance = bodyLow - low;
-    const highWickDistance = high - bodyHigh;
-
+    // Both surrounding bars must remain in the same local market. This is what
+    // separates a malformed one-minute record from a real move that continues.
+    const anchorBand = Math.max(anchor * 0.0025, neighborRange * 4, 0.05);
     if (
-      lowWickDistance > outlierThreshold &&
-      referencePrice - low > outlierThreshold
+      Math.abs(previousClose - anchor) > anchorBand ||
+      Math.abs(nextOpen - anchor) > anchorBand ||
+      Math.abs(nextClose - anchor) > anchorBand
     ) {
-      repairedLow = Math.min(bodyLow, referencePrice - normalBand);
+      return false;
     }
 
-    if (
-      highWickDistance > outlierThreshold &&
-      high - referencePrice > outlierThreshold
-    ) {
-      repairedHigh = Math.max(bodyHigh, referencePrice + normalBand);
+    const outlierThreshold = Math.max(anchor * 0.006, neighborRange * 8, 0.15);
+    const normalWick = Math.max(anchor * 0.0012, neighborRange * 2.5, 0.03);
+
+    const openDeviation = Math.abs(open - anchor);
+    const closeDeviation = Math.abs(close - anchor);
+    const highDeviation = high - anchor;
+    const lowDeviation = anchor - low;
+    const bodyRange = Math.abs(close - open);
+
+    const bodyCorrupted =
+      openDeviation > outlierThreshold ||
+      closeDeviation > outlierThreshold ||
+      bodyRange > outlierThreshold;
+
+    const wickCorrupted =
+      highDeviation > outlierThreshold ||
+      lowDeviation > outlierThreshold;
+
+    if (!bodyCorrupted && !wickCorrupted) return false;
+
+    let safeOpen = openDeviation <= anchorBand ? open : previousClose;
+    let safeClose = closeDeviation <= anchorBand ? close : nextOpen;
+
+    if (!Number.isFinite(safeOpen) || safeOpen <= 0) safeOpen = anchor;
+    if (!Number.isFinite(safeClose) || safeClose <= 0) safeClose = anchor;
+
+    // When the body itself is malformed, bridge the surrounding real bars. Do
+    // not use volume as a veto: malformed provider rows can also carry malformed
+    // or consolidated volume, which was why the earlier filter missed these.
+    if (bodyCorrupted) {
+      safeOpen = previousClose;
+      safeClose = nextOpen;
     }
 
-    repairedLow = Math.min(repairedLow, open, close, repairedHigh);
-    repairedHigh = Math.max(repairedHigh, open, close, repairedLow);
+    const bodyHigh = Math.max(safeOpen, safeClose);
+    const bodyLow = Math.min(safeOpen, safeClose);
+    const safeHigh = Math.max(bodyHigh, Math.min(high, anchor + normalWick));
+    const safeLow = Math.min(bodyLow, Math.max(low, anchor - normalWick));
 
-    if (repairedLow !== low || repairedHigh !== high) {
-      repaired[index].l = roundCandleNumber(repairedLow);
-      repaired[index].h = roundCandleNumber(repairedHigh);
-      repaired[index].badTickRepaired = true;
+    repaired[index].o = roundCandleNumber(safeOpen);
+    repaired[index].h = roundCandleNumber(safeHigh);
+    repaired[index].l = roundCandleNumber(safeLow);
+    repaired[index].c = roundCandleNumber(safeClose);
+    repaired[index].badTickRepaired = true;
+    repaired[index].badTickRepairType = bodyCorrupted
+      ? "isolated-body-bridge"
+      : "isolated-wick-clamp";
+
+    return true;
+  };
+
+  // Two passes let the second pass evaluate a neighboring malformed row after
+  // the first isolated anomaly has been repaired. The source array remains the
+  // original provider response so normal price action is never progressively
+  // smoothed.
+  for (let pass = 0; pass < 2; pass++) {
+    for (let index = 1; index < source.length - 1; index++) {
+      repairOne(index);
     }
   }
 
@@ -5684,14 +5694,10 @@ app.get("/candles", async (req, res) => {
   const outputsize = 200;
 
   if (!ticker) {
-    return res.json({
-      error: "Missing ticker."
-    });
+    return res.json({ error: "Missing ticker." });
   }
 
-  const realStockTicker = isRealStockTicker(ticker);
-
-  if (!realStockTicker) {
+  if (!isRealStockTicker(ticker)) {
     return res.json({
       ticker,
       interval: tdInterval,
@@ -5700,203 +5706,135 @@ app.get("/candles", async (req, res) => {
     });
   }
 
+  const respondWithCandles = (candles, source, cached = false) => {
+    const cleaned = repairIsolatedStockWicks(candles, tdInterval);
+    const repairedCount = cleaned.reduce(
+      (count, candle) => count + (candle && candle.badTickRepaired ? 1 : 0),
+      0
+    );
+
+    if (!cached) {
+      setCachedCandles(ticker, tdInterval, cleaned, source);
+    }
+
+    return res.json({
+      ticker,
+      interval: tdInterval,
+      candles: withChartIndicators(cleaned),
+      cached,
+      indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" },
+      livePatched: false,
+      synthetic: false,
+      source,
+      repairedCount,
+      extendedHoursIncluded: tdInterval !== "1day"
+    });
+  };
+
   const cachedEntry = getCachedCandleEntry(ticker, tdInterval);
+  const cachedSourceName = String(cachedEntry && cachedEntry.source || "").toLowerCase();
+  const cachedProviderIsAllowed =
+    tdInterval === "1day" ||
+    (!cachedSourceName.includes("massive") && !cachedSourceName.includes("historical"));
 
   if (
     cachedEntry &&
+    cachedProviderIsAllowed &&
     Array.isArray(cachedEntry.data) &&
     cachedEntry.data.length > 0 &&
     (tdInterval === "1day" || isStockCandleSeriesFreshEnough(cachedEntry.data, tdInterval))
   ) {
     triggerYahooQuoteRefresh([ticker]);
-    const cleanedCachedCandles = repairIsolatedStockWicks(cachedEntry.data, tdInterval);
-    cachedEntry.data = cleanedCachedCandles;
-
-    return res.json({
-      ticker,
-      interval: tdInterval,
-      candles: withChartIndicators(patchStockCandlesWithLivePrice(ticker, tdInterval, cleanedCachedCandles)),
-      cached: true,
-      indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" },
-      livePatched: false,
-      synthetic: false,
-      source: cachedEntry.source || "Cached provider",
-      extendedHoursIncluded: tdInterval !== "1day"
-    });
+    return respondWithCandles(cachedEntry.data, cachedEntry.source || "Cached provider", true);
   }
 
   if (cachedEntry && tdInterval !== "1day") {
     deleteCachedCandles(ticker, tdInterval);
   }
 
-  let massiveError = null;
-  let massiveStaleCandles = null;
+  const providerErrors = {};
 
-  // Accuracy-first stock chart path: Massive qualifying-trade aggregates.
-  // Intraday timeframes are rebuilt from one-minute bars with session-specific
-  // anchors so pre-market, regular hours, and after-hours can never be blended.
-  if (tdInterval !== "1day" && MASSIVE_API_KEY) {
-    try {
-      const massiveCandles = await fetchMassiveStockCandlesDeduped(ticker, tdInterval, outputsize);
-
-      if (isMassiveCandleSeriesFreshEnough(massiveCandles, tdInterval)) {
-        setCachedCandles(ticker, tdInterval, massiveCandles, "Massive");
-        return res.json({
-          ticker,
-          interval: tdInterval,
-          candles: withChartIndicators(massiveCandles),
-          cached: false,
-          indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" },
-          livePatched: false,
-          synthetic: false,
-          source: "Massive qualifying-trade aggregates",
-          extendedHoursIncluded: tdInterval !== "1day"
-        });
-      }
-
-      // End-of-day Massive plans can be stale while today's market is active.
-      // Keep the accurate historical response as a last resort, but try a live source first.
-      massiveStaleCandles = massiveCandles;
-      massiveError = new Error("Massive candle response is stale for the active market session.");
-    } catch (err) {
-      massiveError = err;
-    }
-  }
-
-  // Live fallback: Yahoo chart data. This is used when Massive is unavailable or
-  // an end-of-day plan has not published the active session yet.
-  let yahooError = null;
+  // Yahoo is authoritative for intraday stock charts because it includes the
+  // complete pre-market, regular, and after-hours session in one real series.
   try {
     const yahooCandles = await fetchYahooStockCandlesDeduped(ticker, tdInterval, outputsize);
 
     if (tdInterval !== "1day" && !isStockCandleSeriesFreshEnough(yahooCandles, tdInterval)) {
       throw new Error(
-        `Yahoo candle response ended on ${candleSeriesLatestEasternDateKey(yahooCandles) || "an unknown date"}; ` +
+        `Yahoo response ended on ${candleSeriesLatestEasternDateKey(yahooCandles) || "an unknown date"}; ` +
         `expected ${expectedLatestStockCandleDateKey()}.`
       );
     }
 
-    return res.json({
-      ticker,
-      interval: tdInterval,
-      candles: withChartIndicators(patchStockCandlesWithLivePrice(ticker, tdInterval, yahooCandles)),
-      cached: false,
-      indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" },
-      livePatched: false,
-      synthetic: false,
-      source: "Yahoo Finance fallback",
-      extendedHoursIncluded: tdInterval !== "1day"
-    });
-  } catch (err) {
-    yahooError = err;
+    return respondWithCandles(yahooCandles, "Yahoo Finance primary");
+  } catch (error) {
+    providerErrors.yahoo = error && error.message || String(error);
     deleteCachedCandles(ticker, tdInterval);
   }
 
-  // Real stocks use Twelve Data as the final live-data backup. If that backup is
-  // disabled while the market is closed, return the accurate Massive historical
-  // series rather than fabricating candles or dropping the chart entirely.
-  if (!shouldUseTwelveDataCandleBackup(ticker)) {
-    if (massiveStaleCandles && massiveStaleCandles.length > 0) {
-      return res.json({
-        ticker,
-        interval: tdInterval,
-        candles: withChartIndicators(massiveStaleCandles),
-        cached: false,
-        indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" },
-        livePatched: false,
-        synthetic: false,
-        source: "Massive historical aggregates",
-        stale: true,
-        extendedHoursIncluded: tdInterval !== "1day"
-      });
-    }
+  // Twelve Data is the first fallback. The previous order preferred Massive,
+  // which is where the isolated $10-$15 false bodies were still entering the
+  // chart whenever Yahoo was temporarily unavailable.
+  if (
+    TWELVE_DATA_API_KEY &&
+    shouldUseTwelveDataCandleBackup(ticker) &&
+    twelveDataCandleCreditsUsedToday < MAX_TWELVE_DATA_CANDLE_CREDITS_PER_DAY
+  ) {
+    const realTicker = getRealTicker(ticker);
+    const url =
+      `https://api.twelvedata.com/time_series` +
+      `?symbol=${encodeURIComponent(realTicker)}` +
+      `&interval=${encodeURIComponent(tdInterval)}` +
+      `&outputsize=${outputsize}` +
+      `&apikey=${encodeURIComponent(TWELVE_DATA_API_KEY)}`;
 
-    return res.json({
-      ticker,
-      interval: tdInterval,
-      error: "No accurate stock candle provider returned usable data.",
-      massiveProviderError: massiveError && massiveError.message,
-      yahooProviderError: yahooError && yahooError.message,
-      synthetic: false
-    });
-  }
+    try {
+      const data = await tdRequest(url, TD_PRIORITY.candle);
+      if (data.status === "error" || !Array.isArray(data.values)) {
+        throw new Error(data.message || "No Twelve Data candle data.");
+      }
 
-  if (!TWELVE_DATA_API_KEY) {
-    return res.json({
-      ticker,
-      interval: tdInterval,
-      error: "Yahoo did not return usable stock candles, and TWELVE_DATA_API_KEY is not set for real-data backup.",
-      synthetic: false
-    });
-  }
-
-  if (twelveDataCandleCreditsUsedToday >= MAX_TWELVE_DATA_CANDLE_CREDITS_PER_DAY) {
-    return res.json({
-      ticker,
-      interval: tdInterval,
-      error: "Proxy Twelve Data candle cap reached for today. Real-data candle backup unavailable.",
-      synthetic: false
-    });
-  }
-
-  const realTicker = getRealTicker(ticker);
-  const url =
-    `https://api.twelvedata.com/time_series` +
-    `?symbol=${realTicker}` +
-    `&interval=${tdInterval}` +
-    `&outputsize=${outputsize}` +
-    `&apikey=${TWELVE_DATA_API_KEY}`;
-
-  try {
-    const data = await tdRequest(url, TD_PRIORITY.candle);
-
-    if (data.status === "error" || !data.values) {
-      return res.json({
-        ticker,
-        interval: tdInterval,
-        error: data.message || "No Twelve Data candle data",
-        synthetic: false
-      });
-    }
-
-    const candles = repairIsolatedStockWicks(
-      data.values
+      const twelveCandles = data.values
+        .slice()
         .reverse()
-        .map(v => normalizeStockCandleRecord({
-          datetime: v.datetime,
+        .map(value => normalizeStockCandleRecord({
+          datetime: value.datetime,
           interval: tdInterval,
-          open: parseFloat(v.open),
-          high: parseFloat(v.high),
-          low: parseFloat(v.low),
-          close: parseFloat(v.close),
-          volume: parseFloat(v.volume)
+          open: parseFloat(value.open),
+          high: parseFloat(value.high),
+          low: parseFloat(value.low),
+          close: parseFloat(value.close),
+          volume: parseFloat(value.volume)
         }))
-        .filter(Boolean),
-      tdInterval
-    );
+        .filter(Boolean);
 
-    setCachedCandles(ticker, tdInterval, candles, "Twelve Data");
-    twelveDataCandleCreditsUsedToday++;
+      if (twelveCandles.length === 0) {
+        throw new Error("Twelve Data returned no usable stock candles.");
+      }
 
-    res.json({
-      ticker,
-      interval: tdInterval,
-      candles: withChartIndicators(patchStockCandlesWithLivePrice(ticker, tdInterval, candles)),
-      cached: false,
-      indicators: { rsiPeriod: RSI_PERIOD, rsiSource: "candle-close" },
-      livePatched: false,
-      synthetic: false,
-      source: "Twelve Data",
-      extendedHoursIncluded: tdInterval !== "1day"
-    });
-  } catch (e) {
-    res.json({
-      ticker,
-      interval: tdInterval,
-      error: e.message,
-      synthetic: false
-    });
+      if (tdInterval !== "1day" && !isStockCandleSeriesFreshEnough(twelveCandles, tdInterval)) {
+        throw new Error("Twelve Data candle response was stale for the active session.");
+      }
+
+      twelveDataCandleCreditsUsedToday++;
+      return respondWithCandles(twelveCandles, "Twelve Data fallback");
+    } catch (error) {
+      providerErrors.twelveData = error && error.message || String(error);
+    }
   }
+
+  // Accuracy is preferred over availability. Massive is intentionally not used
+  // for intraday stock candles because its occasional malformed aggregate rows
+  // are the exact source of the false vertical bodies/wicks players reported.
+
+
+  return res.json({
+    ticker,
+    interval: tdInterval,
+    error: "No accurate stock candle provider returned usable data.",
+    providerErrors,
+    synthetic: false
+  });
 });
 
 // ============================
