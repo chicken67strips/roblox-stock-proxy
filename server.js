@@ -1269,10 +1269,21 @@ async function refreshAllYahooQuotes() {
 
   for (let i = 0; i < TICKERS.length; i += YAHOO_QUOTE_BATCH_SIZE) {
     const batch = TICKERS.slice(i, i + YAHOO_QUOTE_BATCH_SIZE);
-    updated += await fetchYahooQuotesDeduped(batch);
+    try {
+      updated += await fetchYahooQuotesDeduped(batch);
+    } catch (error) {
+      // A single failed Yahoo batch must not abort the entire closed-market
+      // refresh. Continue through the remaining batches, then fill missing
+      // tickers from Yahoo's recent daily-chart closes below.
+      console.warn(`[YAHOO] Quote batch ${i / YAHOO_QUOTE_BATCH_SIZE + 1} failed: ${error.message}`);
+    }
   }
 
-  updated += await fillMissingYahooPricesWithChartFallback();
+  try {
+    updated += await fillMissingYahooPricesWithChartFallback();
+  } catch (error) {
+    console.warn(`[YAHOO] Missing-price chart fallback failed: ${error.message}`);
+  }
 
   allYahooQuotesFetchedAtMs = Date.now();
   return updated;
