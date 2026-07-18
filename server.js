@@ -2304,137 +2304,225 @@ function repairIsolatedStockWicks(candles, interval) {
   const source = candles.map(candle => ({ ...candle }));
   const repaired = source.map(candle => ({ ...candle }));
 
+  const intervalConfig = {
+    "1min": { window: 7, wickPct: 0.0035, bodyPct: 0.009, maxCluster: 8 },
+    "5min": { window: 6, wickPct: 0.0050, bodyPct: 0.012, maxCluster: 6 },
+    "15min": { window: 5, wickPct: 0.0080, bodyPct: 0.018, maxCluster: 4 },
+    "30min": { window: 4, wickPct: 0.0120, bodyPct: 0.025, maxCluster: 3 },
+    "1h": { window: 4, wickPct: 0.0200, bodyPct: 0.040, maxCluster: 2 }
+  }[interval] || { window: 6, wickPct: 0.005, bodyPct: 0.012, maxCluster: 6 };
+
   const validBar = candle => {
     if (!candle) return false;
     const values = [candle.o, candle.h, candle.l, candle.c].map(Number);
     return values.every(value => Number.isFinite(value) && value > 0);
   };
 
-  const sameSessionAndNearby = (left, right, maxIntervals = 2) => {
+  const bodyCenter = candle => (Number(candle.o) + Number(candle.c)) / 2;
+  const bodyRange = candle => Math.abs(Number(candle.c) - Number(candle.o));
+
+  const sameSession = (left, right) => {
     if (!left || !right) return false;
     if (left.session && right.session && left.session !== right.session) return false;
-
-    const leftTs = Number(left.ts);
-    const rightTs = Number(right.ts);
-    if (Number.isFinite(leftTs) && Number.isFinite(rightTs)) {
-      return Math.abs(leftTs - rightTs) <= intervalSeconds * maxIntervals;
-    }
-
     return true;
   };
 
-  const repairOne = index => {
-    const candle = source[index];
-    const previous = source[index - 1];
-    const next = source[index + 1];
+  const nearbyInTime = (left, right, maxIntervals = 10) => {
+    const leftTs = Number(left && left.ts);
+    const rightTs = Number(right && right.ts);
+    if (!Number.isFinite(leftTs) || !Number.isFinite(rightTs)) return true;
+    return Math.abs(leftTs - rightTs) <= intervalSeconds * maxIntervals;
+  };
 
-    if (!validBar(previous) || !validBar(candle) || !validBar(next)) return false;
-    if (!sameSessionAndNearby(previous, candle) || !sameSessionAndNearby(candle, next)) return false;
+  // Build the local market from candle BODIES only. Bad provider wicks can occur
+  // in several consecutive rows; using neighboring highs/lows made the previous
+  // filter treat those bad rows as the new "normal" and leave them untouched.
+  const localStats = index => {
+    const current = source[index];
+    if (!validBar(current)) return null;
 
-    const open = Number(candle.o);
-    const high = Number(candle.h);
-    const low = Number(candle.l);
-    const close = Number(candle.c);
-    const previousClose = Number(previous.c);
-    const nextOpen = Number(next.o);
-    const nextClose = Number(next.c);
+    const centers = [];
+    const bodyRanges = [];
+    const startIndex = Math.max(0, index - intervalConfig.window);
+    const endIndex = Math.min(source.length - 1, index + intervalConfig.window);
 
-    const anchor = medianFinite([
-      previous.o,
-      previous.c,
-      next.o,
-      next.c
-    ]);
-    if (!Number.isFinite(anchor) || anchor <= 0) return false;
+    for (let j = startIndex; j <= endIndex; j++) {
+      if (j === index) continue;
+      const candidate = source[j];
+      if (!validBar(candidate)) continue;
+      if (!sameSession(current, candidate)) continue;
+      if (!nearbyInTime(current, candidate, intervalConfig.window + 2)) continue;
 
-    const previousRange = Math.max(0, Number(previous.h) - Number(previous.l));
-    const nextRange = Math.max(0, Number(next.h) - Number(next.l));
-    const neighborRange = Math.max(
-      previousRange,
-      nextRange,
-      Math.abs(previousClose - nextOpen),
-      Math.abs(previousClose - nextClose),
-      anchor * 0.00015,
-      0.01
+      centers.push(bodyCenter(candidate));
+      bodyRanges.push(bodyRange(candidate));
+    }
+
+    if (centers.length < 3) return null;
+
+    const center = medianFinite(centers);
+    const deviations = centers.map(value => Math.abs(value - center));
+    const mad = medianFinite(deviations);
+    const medianBody = medianFinite(bodyRanges);
+    const scale = Math.max(
+      medianBody,
+      mad * 1.4826,
+      center * 0.00025,
+      0.02
     );
 
-    // Both surrounding bars must remain in the same local market. This is what
-    // separates a malformed one-minute record from a real move that continues.
-    const anchorBand = Math.max(anchor * 0.0025, neighborRange * 4, 0.05);
-    if (
-      Math.abs(previousClose - anchor) > anchorBand ||
-      Math.abs(nextOpen - anchor) > anchorBand ||
-      Math.abs(nextClose - anchor) > anchorBand
-    ) {
-      return false;
-    }
-
-    const outlierThreshold = Math.max(anchor * 0.006, neighborRange * 8, 0.15);
-    const normalWick = Math.max(anchor * 0.0012, neighborRange * 2.5, 0.03);
-
-    const openDeviation = Math.abs(open - anchor);
-    const closeDeviation = Math.abs(close - anchor);
-    const highDeviation = high - anchor;
-    const lowDeviation = anchor - low;
-    const bodyRange = Math.abs(close - open);
-
-    const bodyCorrupted =
-      openDeviation > outlierThreshold ||
-      closeDeviation > outlierThreshold ||
-      bodyRange > outlierThreshold;
-
-    const wickCorrupted =
-      highDeviation > outlierThreshold ||
-      lowDeviation > outlierThreshold;
-
-    if (!bodyCorrupted && !wickCorrupted) return false;
-
-    let safeOpen = openDeviation <= anchorBand ? open : previousClose;
-    let safeClose = closeDeviation <= anchorBand ? close : nextOpen;
-
-    if (!Number.isFinite(safeOpen) || safeOpen <= 0) safeOpen = anchor;
-    if (!Number.isFinite(safeClose) || safeClose <= 0) safeClose = anchor;
-
-    // When the body itself is malformed, bridge the surrounding real bars. Do
-    // not use volume as a veto: malformed provider rows can also carry malformed
-    // or consolidated volume, which was why the earlier filter missed these.
-    if (bodyCorrupted) {
-      safeOpen = previousClose;
-      safeClose = nextOpen;
-    }
-
-    const bodyHigh = Math.max(safeOpen, safeClose);
-    const bodyLow = Math.min(safeOpen, safeClose);
-    const safeHigh = Math.max(bodyHigh, Math.min(high, anchor + normalWick));
-    const safeLow = Math.min(bodyLow, Math.max(low, anchor - normalWick));
-
-    repaired[index].o = roundCandleNumber(safeOpen);
-    repaired[index].h = roundCandleNumber(safeHigh);
-    repaired[index].l = roundCandleNumber(safeLow);
-    repaired[index].c = roundCandleNumber(safeClose);
-    repaired[index].badTickRepaired = true;
-    repaired[index].badTickRepairType = bodyCorrupted
-      ? "isolated-body-bridge"
-      : "isolated-wick-clamp";
-
-    return true;
+    return { center, scale };
   };
 
-  // Two passes let the second pass evaluate a neighboring malformed row after
-  // the first isolated anomaly has been repaired. The source array remains the
-  // original provider response so normal price action is never progressively
-  // smoothed.
-  for (let pass = 0; pass < 2; pass++) {
-    for (let index = 1; index < source.length - 1; index++) {
-      repairOne(index);
+  // Pass 1: clamp abnormal high/low prints even when several adjacent candles
+  // have the same corrupted wick. Candle bodies must still be near the local
+  // market, so real sustained moves and gaps are preserved.
+  for (let index = 0; index < source.length; index++) {
+    const candle = source[index];
+    const stats = localStats(index);
+    if (!validBar(candle) || !stats) continue;
+
+    const open = Number(candle.o);
+    const close = Number(candle.c);
+    const high = Number(candle.h);
+    const low = Number(candle.l);
+    const bodyHigh = Math.max(open, close);
+    const bodyLow = Math.min(open, close);
+    const bodyMid = (open + close) / 2;
+
+    const bodyTolerance = Math.max(
+      stats.center * intervalConfig.bodyPct,
+      stats.scale * 12,
+      0.25
+    );
+    const bodyLooksLocal =
+      Math.abs(bodyMid - stats.center) <= bodyTolerance &&
+      Math.abs(open - stats.center) <= bodyTolerance * 1.35 &&
+      Math.abs(close - stats.center) <= bodyTolerance * 1.35;
+
+    if (!bodyLooksLocal) continue;
+
+    const wickTrigger = Math.max(
+      stats.center * intervalConfig.wickPct,
+      stats.scale * 10,
+      0.20
+    );
+    const wickToKeep = Math.max(
+      stats.center * 0.0015,
+      stats.scale * 4,
+      0.06
+    );
+
+    let changed = false;
+    let safeHigh = high;
+    let safeLow = low;
+
+    if ((high - bodyHigh) > wickTrigger) {
+      safeHigh = bodyHigh + wickToKeep;
+      changed = true;
+    }
+    if ((bodyLow - low) > wickTrigger) {
+      safeLow = bodyLow - wickToKeep;
+      changed = true;
+    }
+
+    if (changed) {
+      repaired[index].h = roundCandleNumber(Math.max(bodyHigh, safeHigh));
+      repaired[index].l = roundCandleNumber(Math.min(bodyLow, safeLow));
+      repaired[index].badTickRepaired = true;
+      repaired[index].badTickRepairType = "cluster-wick-clamp";
     }
   }
 
-  return repaired;
-}
+  // Pass 2: detect short runs whose candle bodies themselves are far away from
+  // the local market. A run is bridged only when stable bars on BOTH sides return
+  // to nearly the same price. This catches malformed multi-row drops without
+  // flattening a genuine move that continues.
+  const bodyOutlier = new Array(source.length).fill(false);
+  const statsByIndex = new Array(source.length).fill(null);
 
-function yahooTickerSymbol(ticker) {
-  return getRealTicker(ticker).replace(".", "-");
+  for (let index = 0; index < source.length; index++) {
+    const candle = source[index];
+    const stats = localStats(index);
+    statsByIndex[index] = stats;
+    if (!validBar(candle) || !stats) continue;
+
+    const mid = bodyCenter(candle);
+    const threshold = Math.max(
+      stats.center * intervalConfig.bodyPct,
+      stats.scale * 12,
+      0.30
+    );
+    bodyOutlier[index] = Math.abs(mid - stats.center) > threshold;
+  }
+
+  let runStart = 0;
+  while (runStart < bodyOutlier.length) {
+    if (!bodyOutlier[runStart]) {
+      runStart++;
+      continue;
+    }
+
+    let runEnd = runStart;
+    while (runEnd + 1 < bodyOutlier.length && bodyOutlier[runEnd + 1]) {
+      runEnd++;
+    }
+
+    const runLength = runEnd - runStart + 1;
+    const previousIndex = runStart - 1;
+    const nextIndex = runEnd + 1;
+    const previous = source[previousIndex];
+    const next = source[nextIndex];
+    const stats = statsByIndex[runStart] || statsByIndex[runEnd];
+
+    if (
+      runLength <= intervalConfig.maxCluster &&
+      validBar(previous) &&
+      validBar(next) &&
+      stats &&
+      sameSession(previous, next) &&
+      nearbyInTime(previous, next, runLength + 3)
+    ) {
+      const leftPrice = Number(previous.c);
+      const rightPrice = Number(next.o);
+      const bridgeTolerance = Math.max(
+        stats.center * 0.006,
+        stats.scale * 14,
+        0.40
+      );
+
+      if (
+        Math.abs(leftPrice - rightPrice) <= bridgeTolerance &&
+        Math.abs(leftPrice - stats.center) <= bridgeTolerance * 1.5 &&
+        Math.abs(rightPrice - stats.center) <= bridgeTolerance * 1.5
+      ) {
+        let priorClose = leftPrice;
+        for (let index = runStart; index <= runEnd; index++) {
+          const progress = (index - runStart + 1) / (runLength + 1);
+          const bridgedClose = leftPrice + ((rightPrice - leftPrice) * progress);
+          const bridgedOpen = priorClose;
+          const wickToKeep = Math.max(
+            stats.center * 0.0015,
+            stats.scale * 4,
+            0.06
+          );
+          const bodyHigh = Math.max(bridgedOpen, bridgedClose);
+          const bodyLow = Math.min(bridgedOpen, bridgedClose);
+
+          repaired[index].o = roundCandleNumber(bridgedOpen);
+          repaired[index].c = roundCandleNumber(bridgedClose);
+          repaired[index].h = roundCandleNumber(bodyHigh + wickToKeep);
+          repaired[index].l = roundCandleNumber(bodyLow - wickToKeep);
+          repaired[index].badTickRepaired = true;
+          repaired[index].badTickRepairType = "cluster-body-bridge";
+          priorClose = bridgedClose;
+        }
+      }
+    }
+
+    runStart = runEnd + 1;
+  }
+
+  return repaired;
 }
 
 async function fetchYahooStockCandles(ticker, interval, limit = 200) {
