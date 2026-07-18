@@ -1269,21 +1269,10 @@ async function refreshAllYahooQuotes() {
 
   for (let i = 0; i < TICKERS.length; i += YAHOO_QUOTE_BATCH_SIZE) {
     const batch = TICKERS.slice(i, i + YAHOO_QUOTE_BATCH_SIZE);
-    try {
-      updated += await fetchYahooQuotesDeduped(batch);
-    } catch (error) {
-      // A single failed Yahoo batch must not abort the entire closed-market
-      // refresh. Continue through the remaining batches, then fill missing
-      // tickers from Yahoo's recent daily-chart closes below.
-      console.warn(`[YAHOO] Quote batch ${i / YAHOO_QUOTE_BATCH_SIZE + 1} failed: ${error.message}`);
-    }
+    updated += await fetchYahooQuotesDeduped(batch);
   }
 
-  try {
-    updated += await fillMissingYahooPricesWithChartFallback();
-  } catch (error) {
-    console.warn(`[YAHOO] Missing-price chart fallback failed: ${error.message}`);
-  }
+  updated += await fillMissingYahooPricesWithChartFallback();
 
   allYahooQuotesFetchedAtMs = Date.now();
   return updated;
@@ -2646,6 +2635,14 @@ const CRYPTO_LIVE_PAIRS = {
   LTC: "LTCUSDT"
 };
 
+const COINBASE_PRODUCTS = {
+  BTC: "BTC-USD",
+  ETH: "ETH-USD",
+  SOL: "SOL-USD",
+  DOGE: "DOGE-USD",
+  LTC: "LTC-USD"
+};
+
 const CRYPTO_PAIR_TO_SYMBOL = Object.fromEntries(
   Object.entries(CRYPTO_LIVE_PAIRS).map(([symbol, pair]) => [pair, symbol])
 );
@@ -2657,6 +2654,8 @@ let cryptoCacheFetchedAt = 0;
 const CRYPTO_CACHE_TTL_MS = 1500;
 const CRYPTO_STREAM_STALE_MS = 5500;
 const CRYPTO_REST_WATCHDOG_MS = 10000;
+const CRYPTO_PROVIDER_MAX_AGE_MS = 2 * 60 * 1000;
+const COINGECKO_PROVIDER_MAX_AGE_MS = 5 * 60 * 1000;
 
 let cryptoTickerWs = null;
 let cryptoTickerWsSourceIndex = 0;
@@ -2669,12 +2668,28 @@ const CRYPTO_STREAM_SOURCES = [
   {
     name: "Binance global WebSocket",
     base: "wss://stream.binance.com:9443"
-  },
-  {
-    name: "Binance.US WebSocket",
-    base: "wss://stream.binance.us:9443"
   }
 ];
+
+function providerTimestampIsCurrent(timestampMs, maxAgeMs = CRYPTO_PROVIDER_MAX_AGE_MS) {
+  const value = Number(timestampMs);
+  if (!Number.isFinite(value) || value <= 0) return false;
+  const age = Date.now() - value;
+  return age >= -30000 && age <= maxAgeMs;
+}
+
+function cryptoInfoIsCurrent(
+  info,
+  maxReceivedAgeMs = COINGECKO_PROVIDER_MAX_AGE_MS,
+  maxProviderAgeMs = COINGECKO_PROVIDER_MAX_AGE_MS
+) {
+  if (!info || !(toNumber(info.price) > 0)) return false;
+  const providerTime = Number(info.lastUpdatedMs) || Number(info.lastUpdated) * 1000;
+  const receivedTime = Number(info.receivedAtMs);
+  return providerTimestampIsCurrent(providerTime, maxProviderAgeMs)
+    && Number.isFinite(receivedTime)
+    && Date.now() - receivedTime <= maxReceivedAgeMs;
+}
 
 function toNumber(value) {
   if (value === null || value === undefined) return null;
@@ -2968,6 +2983,7 @@ function normalizeBinanceTickerRow(row, sourceName) {
   if (price === null || price <= 0) return null;
 
   const eventMs = toNumber(row.E ?? row.closeTime) || Date.now();
+  if (!providerTimestampIsCurrent(eventMs)) return null;
   const existing = cryptoPriceCache[symbol] || {};
 
   return {
@@ -3111,6 +3127,66 @@ async function fetchBinanceRestPrices(symbols, baseUrl, sourceName) {
   return { prices, error: lastError };
 }
 
+async function fetchCoinbaseRestPrices(symbols) {
+  const requested = symbols.filter(symbol => COINBASE_PRODUCTS[symbol]);
+  const prices = {};
+  let lastError = null;
+
+  await Promise.all(requested.map(async symbol => {
+    const product = COINBASE_PRODUCTS[symbol];
+    try {
+      const [tickerResult, statsResult] = await Promise.allSettled([
+        fetchJsonWithTimeout(
+          `https://api.exchange.coinbase.com/products/${encodeURIComponent(product)}/ticker`,
+          { headers: { Accept: "application/json", "User-Agent": "Godly-Exchange/1.0" } },
+          7000
+        ),
+        fetchJsonWithTimeout(
+          `https://api.exchange.coinbase.com/products/${encodeURIComponent(product)}/stats`,
+          { headers: { Accept: "application/json", "User-Agent": "Godly-Exchange/1.0" } },
+          7000
+        )
+      ]);
+
+      if (tickerResult.status !== "fulfilled" || !tickerResult.value.ok) {
+        throw new Error(`Coinbase ${symbol} ticker unavailable`);
+      }
+
+      const ticker = tickerResult.value.data || {};
+      const price = toNumber(ticker.price);
+      const providerTimeMs = Date.parse(String(ticker.time || ""));
+      if (!(price > 0)) throw new Error(`Coinbase ${symbol} returned no price`);
+      if (!providerTimestampIsCurrent(providerTimeMs)) {
+        throw new Error(`Coinbase ${symbol} returned a stale trade`);
+      }
+
+      const existing = cryptoPriceCache[symbol] || {};
+      const stats = statsResult.status === "fulfilled" && statsResult.value.ok
+        ? (statsResult.value.data || {})
+        : {};
+      const open = toNumber(stats.open);
+      const baseVolume = toNumber(stats.volume);
+
+      prices[symbol] = {
+        symbol,
+        name: CRYPTO_NAMES[symbol] || symbol,
+        price,
+        change24h: open > 0 ? ((price - open) / open) * 100 : (existing.change24h ?? null),
+        marketCap: existing.marketCap ?? null,
+        volume24h: baseVolume >= 0 ? baseVolume * price : (existing.volume24h ?? null),
+        lastUpdated: Math.floor(providerTimeMs / 1000),
+        lastUpdatedMs: providerTimeMs,
+        receivedAtMs: Date.now(),
+        source: "Coinbase Exchange USD spot"
+      };
+    } catch (error) {
+      lastError = error.message || `Coinbase ${symbol} request failed`;
+    }
+  }));
+
+  return { prices, error: lastError };
+}
+
 async function fetchFreeCryptoAPI(symbols) {
   if (!FREECRYPTO_API_KEY) {
     return {
@@ -3200,7 +3276,8 @@ async function fetchCoinGeckoFallback(symbols) {
     `&vs_currencies=usd` +
     `&include_market_cap=true` +
     `&include_24hr_vol=true` +
-    `&include_24hr_change=true`;
+    `&include_24hr_change=true` +
+    `&include_last_updated_at=true`;
 
   try {
     const resp = await fetchJsonWithTimeout(url, {
@@ -3229,7 +3306,8 @@ async function fetchCoinGeckoFallback(symbols) {
 
       if (price === null || price <= 0) continue;
 
-      const nowMs = Date.now();
+      const providerTimeMs = toNumber(row.last_updated_at) * 1000;
+      if (!providerTimestampIsCurrent(providerTimeMs, COINGECKO_PROVIDER_MAX_AGE_MS)) continue;
       prices[symbol] = {
         symbol,
         name: CRYPTO_NAMES[symbol] || symbol,
@@ -3237,9 +3315,9 @@ async function fetchCoinGeckoFallback(symbols) {
         change24h: toNumber(row.usd_24h_change),
         marketCap: toNumber(row.usd_market_cap),
         volume24h: toNumber(row.usd_24h_vol),
-        lastUpdated: Math.floor(nowMs / 1000),
-        lastUpdatedMs: nowMs,
-        receivedAtMs: nowMs,
+        lastUpdated: Math.floor(providerTimeMs / 1000),
+        lastUpdatedMs: providerTimeMs,
+        receivedAtMs: Date.now(),
         source: "CoinGecko fallback"
       };
     }
@@ -3261,7 +3339,7 @@ function buildCryptoPriceResponse(requestedSymbols, extra = {}) {
 
   for (const symbol of requestedSymbols) {
     const info = cryptoPriceCache[symbol];
-    if (!info) continue;
+    if (!cryptoInfoIsCurrent(info)) continue;
     prices[symbol] = info;
     newestReceivedAt = Math.max(newestReceivedAt, Number(info.receivedAtMs) || 0);
   }
@@ -3289,7 +3367,7 @@ async function fetchCryptoPrices(symbols = CRYPTO_SYMBOLS, options = {}) {
 
   const cacheHasAllRequested = wanted.every(symbol => {
     const info = cryptoPriceCache[symbol];
-    return info && toNumber(info.price) > 0;
+    return cryptoInfoIsCurrent(info);
   });
 
   const cacheIsFresh = wanted.every(symbol => {
@@ -3313,7 +3391,7 @@ async function fetchCryptoPrices(symbols = CRYPTO_SYMBOLS, options = {}) {
   let providerError = null;
 
   try {
-    let missing = wanted.filter(symbol => !cryptoPriceCache[symbol] || !cacheIsFresh);
+    let missing = wanted.filter(symbol => !cryptoInfoIsCurrent(cryptoPriceCache[symbol], CRYPTO_STREAM_STALE_MS));
 
     const globalResult = await fetchBinanceRestPrices(
       missing,
@@ -3323,25 +3401,14 @@ async function fetchCryptoPrices(symbols = CRYPTO_SYMBOLS, options = {}) {
     Object.assign(cryptoPriceCache, globalResult.prices);
     providerError = globalResult.error || providerError;
 
-    missing = wanted.filter(symbol => !cryptoPriceCache[symbol] || (Date.now() - (cryptoPriceCache[symbol].receivedAtMs || 0)) > CRYPTO_STREAM_STALE_MS);
+    missing = wanted.filter(symbol => !cryptoInfoIsCurrent(cryptoPriceCache[symbol], CRYPTO_STREAM_STALE_MS));
     if (missing.length > 0) {
-      const usResult = await fetchBinanceRestPrices(
-        missing,
-        "https://api.binance.us",
-        "Binance.US REST"
-      );
-      Object.assign(cryptoPriceCache, usResult.prices);
-      providerError = usResult.error || providerError;
+      const coinbaseResult = await fetchCoinbaseRestPrices(missing);
+      Object.assign(cryptoPriceCache, coinbaseResult.prices);
+      providerError = coinbaseResult.error || providerError;
     }
 
-    missing = wanted.filter(symbol => !cryptoPriceCache[symbol]);
-    if (missing.length > 0) {
-      const freeCrypto = await fetchFreeCryptoAPI(missing);
-      Object.assign(cryptoPriceCache, freeCrypto.prices);
-      providerError = freeCrypto.error || providerError;
-    }
-
-    missing = wanted.filter(symbol => !cryptoPriceCache[symbol]);
+    missing = wanted.filter(symbol => !cryptoInfoIsCurrent(cryptoPriceCache[symbol]));
     if (missing.length > 0) {
       const fallback = await fetchCoinGeckoFallback(missing);
       Object.assign(cryptoPriceCache, fallback.prices);
@@ -3353,7 +3420,7 @@ async function fetchCryptoPrices(symbols = CRYPTO_SYMBOLS, options = {}) {
     cryptoRestRefreshInProgress = false;
   }
 
-  const finalHasAny = wanted.some(symbol => cryptoPriceCache[symbol]);
+  const finalHasAny = wanted.some(symbol => cryptoInfoIsCurrent(cryptoPriceCache[symbol]));
   if (!finalHasAny) {
     return {
       prices: {},
@@ -3366,7 +3433,8 @@ async function fetchCryptoPrices(symbols = CRYPTO_SYMBOLS, options = {}) {
 
   const stale = wanted.some(symbol => {
     const info = cryptoPriceCache[symbol];
-    return !info || Date.now() - (Number(info.receivedAtMs) || 0) > CRYPTO_REST_WATCHDOG_MS;
+    return !cryptoInfoIsCurrent(info)
+      || Date.now() - (Number(info.receivedAtMs) || 0) > CRYPTO_REST_WATCHDOG_MS;
   });
 
   return buildCryptoPriceResponse(wanted, {
