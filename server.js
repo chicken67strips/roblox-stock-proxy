@@ -2533,71 +2533,91 @@ async function fetchYahooStockCandles(ticker, interval, limit = 200) {
   }
 
   const yahooSymbol = yahooTickerSymbol(ticker);
-  const url =
-    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}` +
-    `?range=${encodeURIComponent(cfg.range)}` +
-    `&interval=${encodeURIComponent(cfg.interval)}` +
-    `&includePrePost=true&_=${Date.now()}`;
+  const hosts = [
+    "query1.finance.yahoo.com",
+    "query2.finance.yahoo.com"
+  ];
+  const errors = [];
 
-  const resp = await fetchJsonWithTimeout(
-    url,
-    {
-      headers: {
-        Accept: "application/json",
-        "User-Agent": "Mozilla/5.0"
+  for (const host of hosts) {
+    const url =
+      `https://${host}/v8/finance/chart/${encodeURIComponent(yahooSymbol)}` +
+      `?range=${encodeURIComponent(cfg.range)}` +
+      `&interval=${encodeURIComponent(cfg.interval)}` +
+      `&includePrePost=true` +
+      `&events=div%2Csplits` +
+      `&lang=en-US&region=US&_=${Date.now()}`;
+
+    try {
+      const resp = await fetchJsonWithTimeout(
+        url,
+        {
+          headers: {
+            Accept: "application/json,text/plain,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            Pragma: "no-cache",
+            Referer: "https://finance.yahoo.com/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36"
+          }
+        },
+        15000
+      );
+
+      if (!resp.ok) {
+        throw new Error(resp.data?.chart?.error?.description || `Yahoo ${host} HTTP ${resp.status}`);
       }
-    },
-    12000
-  );
 
-  if (!resp.ok) {
-    throw new Error(resp.data?.chart?.error?.description || `Yahoo HTTP ${resp.status}`);
+      const chart = resp.data && resp.data.chart;
+      const result = chart && Array.isArray(chart.result) && chart.result[0];
+
+      if (!result) {
+        throw new Error(chart?.error?.description || `No Yahoo chart result returned by ${host}.`);
+      }
+
+      const timestamps = Array.isArray(result.timestamp) ? result.timestamp : [];
+      const quote = result.indicators && result.indicators.quote && result.indicators.quote[0];
+
+      if (!quote || timestamps.length === 0) {
+        throw new Error(`Yahoo ${host} chart result missing quote data.`);
+      }
+
+      const candles = [];
+
+      for (let i = 0; i < timestamps.length; i++) {
+        const o = toNumber(quote.open && quote.open[i]);
+        const h = toNumber(quote.high && quote.high[i]);
+        const l = toNumber(quote.low && quote.low[i]);
+        const c = toNumber(quote.close && quote.close[i]);
+        const v = toNumber(quote.volume && quote.volume[i]) || 0;
+
+        if (o === null || h === null || l === null || c === null) continue;
+        if (o <= 0 || h <= 0 || l <= 0 || c <= 0) continue;
+
+        const candle = normalizeStockCandleRecord({
+          timestampSeconds: Number(timestamps[i]),
+          interval,
+          open: o,
+          high: h,
+          low: l,
+          close: c,
+          volume: v
+        });
+
+        if (candle) candles.push(candle);
+      }
+
+      if (candles.length === 0) {
+        throw new Error(`Yahoo ${host} returned no usable candle data.`);
+      }
+
+      return repairIsolatedStockWicks(candles, interval).slice(-limit);
+    } catch (error) {
+      errors.push(`${host}: ${error && error.message || String(error)}`);
+    }
   }
 
-  const chart = resp.data && resp.data.chart;
-  const result = chart && Array.isArray(chart.result) && chart.result[0];
-
-  if (!result) {
-    throw new Error(chart?.error?.description || "No Yahoo chart result returned.");
-  }
-
-  const timestamps = Array.isArray(result.timestamp) ? result.timestamp : [];
-  const quote = result.indicators && result.indicators.quote && result.indicators.quote[0];
-
-  if (!quote || timestamps.length === 0) {
-    throw new Error("Yahoo chart result missing quote data.");
-  }
-
-  const candles = [];
-
-  for (let i = 0; i < timestamps.length; i++) {
-    const o = toNumber(quote.open && quote.open[i]);
-    const h = toNumber(quote.high && quote.high[i]);
-    const l = toNumber(quote.low && quote.low[i]);
-    const c = toNumber(quote.close && quote.close[i]);
-    const v = toNumber(quote.volume && quote.volume[i]) || 0;
-
-    if (o === null || h === null || l === null || c === null) continue;
-    if (o <= 0 || h <= 0 || l <= 0 || c <= 0) continue;
-
-    const candle = normalizeStockCandleRecord({
-      timestampSeconds: Number(timestamps[i]),
-      interval,
-      open: o,
-      high: h,
-      low: l,
-      close: c,
-      volume: v
-    });
-
-    if (candle) candles.push(candle);
-  }
-
-  if (candles.length === 0) {
-    throw new Error("No usable Yahoo candle data returned.");
-  }
-
-  return repairIsolatedStockWicks(candles, interval).slice(-limit);
+  throw new Error(`Yahoo candle hosts failed. ${errors.join(" | ")}`);
 }
 
 function generateSyntheticStockCandles(ticker, interval, limit = 200) {
@@ -3627,7 +3647,7 @@ async function fetchCryptoCandles(symbol, interval) {
 // GROUP_ROLE_TOP_TRADER_NAME = Top Trader at GCF
 // GROUP_ROLE_TRADING_MANAGER_NAME = Trading Firm Manager at GCF
 // GROUP_ROLE_CFO_NAME = Chief Financial Officer at GCF
-// GROUP_ROLE_CEO_NAME = Chief Executive Officer
+// GROUP_ROLE_CEO_NAME = Chief Executive Officer at GCF
 // GROUP_ROLE_INDEPENDENT_NAME = Independent Professional Trader
 // GROUP_ROLE_MULTI_MILLIONAIRE_NAME = Multi-Millionaire Trader
 
@@ -3652,8 +3672,9 @@ const GAME_ROLE_TO_GROUP_ROLE_CANDIDATES = {
   "Top Trader at GCF": roleCandidates(process.env.GROUP_ROLE_TOP_TRADER_NAME, "Top Trader at GCF", "Top Trader"),
   "Trading Firm Manager at GCF": roleCandidates(process.env.GROUP_ROLE_TRADING_MANAGER_NAME, "Trading Firm Manager at GCF", "Trading Firm Manager"),
   "Chief Financial Officer at GCF": roleCandidates(process.env.GROUP_ROLE_CFO_NAME, "Chief Financial Officer at GCF", "Chief Financial Officer"),
+  "Chief Executive Officer at GCF": roleCandidates(process.env.GROUP_ROLE_CEO_NAME, "Chief Executive Officer at GCF", "Chief Executive Officer"),
+  "Chief Executive Officer": roleCandidates(process.env.GROUP_ROLE_CEO_NAME, "Chief Executive Officer at GCF", "Chief Executive Officer"),
   "Independent Professional Trader": roleCandidates(process.env.GROUP_ROLE_INDEPENDENT_NAME, "Independent Professional Trader"),
-  "Chief Executive Officer": roleCandidates(process.env.GROUP_ROLE_CEO_NAME, "Chief Executive Officer"),
   "Multi-Millionaire Trader": roleCandidates(process.env.GROUP_ROLE_MULTI_MILLIONAIRE_NAME, "Multi-Millionaire Trader")
 };
 
@@ -3676,8 +3697,9 @@ const GAME_ROLE_ALIASES = {
   "trading firm manager at gcf": "Trading Firm Manager at GCF",
   "chief financial officer": "Chief Financial Officer at GCF",
   "chief financial officer at gcf": "Chief Financial Officer at GCF",
+  "chief executive officer": "Chief Executive Officer at GCF",
+  "chief executive officer at gcf": "Chief Executive Officer at GCF",
   "independent professional trader": "Independent Professional Trader",
-  "chief executive officer": "Chief Executive Officer",
   "multi millionaire trader": "Multi-Millionaire Trader",
   "multi-millionaire trader": "Multi-Millionaire Trader"
 };
@@ -5792,7 +5814,7 @@ app.get("/candles", async (req, res) => {
     });
   }
 
-  const respondWithCandles = (candles, source, cached = false) => {
+  const respondWithCandles = (candles, source, cached = false, extra = {}) => {
     const cleaned = repairIsolatedStockWicks(candles, tdInterval);
     const repairedCount = cleaned.reduce(
       (count, candle) => count + (candle && candle.badTickRepaired ? 1 : 0),
@@ -5813,7 +5835,8 @@ app.get("/candles", async (req, res) => {
       synthetic: false,
       source,
       repairedCount,
-      extendedHoursIncluded: tdInterval !== "1day"
+      extendedHoursIncluded: tdInterval !== "1day",
+      ...extra
     });
   };
 
@@ -5834,10 +5857,9 @@ app.get("/candles", async (req, res) => {
     return respondWithCandles(cachedEntry.data, cachedEntry.source || "Cached provider", true);
   }
 
-  if (cachedEntry && tdInterval !== "1day") {
-    deleteCachedCandles(ticker, tdInterval);
-  }
-
+  // Preserve the last real provider series while refreshing. If Yahoo or Twelve
+  // Data is temporarily unavailable, players should still see the last legitimate
+  // chart instead of an empty "unavailable" panel.
   const providerErrors = {};
 
   // Yahoo is authoritative for intraday stock charts because it includes the
@@ -5855,7 +5877,6 @@ app.get("/candles", async (req, res) => {
     return respondWithCandles(yahooCandles, "Yahoo Finance primary");
   } catch (error) {
     providerErrors.yahoo = error && error.message || String(error);
-    deleteCachedCandles(ticker, tdInterval);
   }
 
   // Twelve Data is the first fallback. The previous order preferred Massive,
@@ -5909,10 +5930,26 @@ app.get("/candles", async (req, res) => {
     }
   }
 
-  // Accuracy is preferred over availability. Massive is intentionally not used
-  // for intraday stock candles because its occasional malformed aggregate rows
-  // are the exact source of the false vertical bodies/wicks players reported.
-
+  // Accuracy is preferred over fabricated availability. Massive remains disabled
+  // for intraday charts because its malformed aggregate rows caused false drops.
+  // However, a previously cached Yahoo/Twelve Data series is still real market data,
+  // so return that last available series rather than blanking every stock chart.
+  if (
+    cachedEntry &&
+    cachedProviderIsAllowed &&
+    Array.isArray(cachedEntry.data) &&
+    cachedEntry.data.length > 0
+  ) {
+    return respondWithCandles(
+      cachedEntry.data,
+      `${cachedEntry.source || "Real market provider"} (last available)`,
+      true,
+      {
+        stale: true,
+        providerErrors
+      }
+    );
+  }
 
   return res.json({
     ticker,
