@@ -1515,14 +1515,11 @@ function getCandleTTL(interval) {
 function shouldUseTwelveDataCandleBackup(ticker) {
   if (!isRealStockTicker(ticker)) return false;
   if (ENABLE_TWELVE_DATA_CANDLES) return true;
-  if (!ENABLE_TWELVE_DATA_MARKET_CANDLE_BACKUP) return false;
 
-  const parts = getEasternDateParts(new Date());
-  const totalMin = parts.hour * 60 + parts.min;
-
-  // Also permit the backup after today's session has ended. This matters when an
-  // end-of-day Massive plan has not published today's bars yet and Yahoo fails.
-  return isStockTradingDateParts(parts) && totalMin >= 4 * 60;
+  // The market-candle backup must remain available while the market is closed,
+  // including weekends. Previously this returned false on Saturday/Sunday, so a
+  // Yahoo outage left every real stock chart unavailable with no fallback attempt.
+  return ENABLE_TWELVE_DATA_MARKET_CANDLE_BACKUP;
 }
 
 function getCachedCandleEntry(ticker, interval) {
@@ -1540,6 +1537,21 @@ function getCachedCandleEntry(ticker, interval) {
 function getCachedCandles(ticker, interval) {
   const entry = getCachedCandleEntry(ticker, interval);
   return entry ? entry.data : null;
+}
+
+function getLastKnownRealCandleEntry(ticker, interval) {
+  const entry = candleCache[`${ticker}:${interval}`];
+  if (!entry || !Array.isArray(entry.data) || entry.data.length === 0) return null;
+
+  const source = String(entry.source || "").toLowerCase();
+  if (source.includes("synthetic")) return null;
+
+  const ageMs = Date.now() - Number(entry.fetchedAt || 0);
+  const maxAgeMs = interval === "1day"
+    ? 14 * 24 * 60 * 60 * 1000
+    : 7 * 24 * 60 * 60 * 1000;
+
+  return ageMs <= maxAgeMs ? entry : null;
 }
 
 function setCachedCandles(ticker, interval, data, source = "Unknown") {
@@ -2619,6 +2631,89 @@ async function fetchYahooStockCandles(ticker, interval, limit = 200) {
 
   throw new Error(`Yahoo candle hosts failed. ${errors.join(" | ")}`);
 }
+
+const FMP_CANDLE_INTERVALS = {
+  "1min": "1min",
+  "5min": "5min",
+  "15min": "15min",
+  "30min": "30min",
+  "1h": "1hour"
+};
+
+async function fetchFmpStockCandles(ticker, interval, limit = 200) {
+  if (!FMP_API_KEY) {
+    throw new Error("FMP_API_KEY is not set.");
+  }
+
+  const realTicker = getRealTicker(ticker);
+  let url;
+
+  if (interval === "1day") {
+    url =
+      `https://financialmodelingprep.com/stable/historical-price-eod/full` +
+      `?symbol=${encodeURIComponent(realTicker)}` +
+      `&apikey=${encodeURIComponent(FMP_API_KEY)}`;
+  } else {
+    const fmpInterval = FMP_CANDLE_INTERVALS[interval];
+    if (!fmpInterval) {
+      throw new Error(`Unsupported FMP candle interval: ${interval}`);
+    }
+
+    url =
+      `https://financialmodelingprep.com/stable/historical-chart/${encodeURIComponent(fmpInterval)}` +
+      `?symbol=${encodeURIComponent(realTicker)}` +
+      `&apikey=${encodeURIComponent(FMP_API_KEY)}`;
+  }
+
+  const response = await fetchJsonWithTimeout(
+    url,
+    {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "GodlyCapitalRealMarketData/1.0"
+      }
+    },
+    15000
+  );
+
+  if (!response.ok) {
+    const message =
+      response.data && (response.data.error || response.data.message)
+        ? (response.data.error || response.data.message)
+        : `FMP HTTP ${response.status}`;
+    throw new Error(String(message));
+  }
+
+  const rows = Array.isArray(response.data)
+    ? response.data
+    : (response.data && Array.isArray(response.data.historical)
+      ? response.data.historical
+      : []);
+
+  if (rows.length === 0) {
+    throw new Error("FMP returned no candle rows.");
+  }
+
+  const candles = rows
+    .map(row => normalizeStockCandleRecord({
+      datetime: row.date || row.datetime,
+      interval,
+      open: row.open,
+      high: row.high,
+      low: row.low,
+      close: row.close,
+      volume: row.volume
+    }))
+    .filter(Boolean)
+    .sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
+
+  if (candles.length === 0) {
+    throw new Error("FMP returned no usable candle data.");
+  }
+
+  return repairIsolatedStockWicks(candles, interval).slice(-limit);
+}
+
 
 function generateSyntheticStockCandles(ticker, interval, limit = 200) {
   return {
@@ -5840,21 +5935,26 @@ app.get("/candles", async (req, res) => {
     });
   };
 
-  const cachedEntry = getCachedCandleEntry(ticker, tdInterval);
+  const freshCachedEntry = getCachedCandleEntry(ticker, tdInterval);
+  const cachedEntry = freshCachedEntry || getLastKnownRealCandleEntry(ticker, tdInterval);
   const cachedSourceName = String(cachedEntry && cachedEntry.source || "").toLowerCase();
   const cachedProviderIsAllowed =
     tdInterval === "1day" ||
-    (!cachedSourceName.includes("massive") && !cachedSourceName.includes("historical"));
+    (!cachedSourceName.includes("massive") && !cachedSourceName.includes("synthetic"));
 
   if (
-    cachedEntry &&
+    freshCachedEntry &&
     cachedProviderIsAllowed &&
-    Array.isArray(cachedEntry.data) &&
-    cachedEntry.data.length > 0 &&
-    (tdInterval === "1day" || isStockCandleSeriesFreshEnough(cachedEntry.data, tdInterval))
+    Array.isArray(freshCachedEntry.data) &&
+    freshCachedEntry.data.length > 0 &&
+    (tdInterval === "1day" || isStockCandleSeriesFreshEnough(freshCachedEntry.data, tdInterval))
   ) {
     triggerYahooQuoteRefresh([ticker]);
-    return respondWithCandles(cachedEntry.data, cachedEntry.source || "Cached provider", true);
+    return respondWithCandles(
+      freshCachedEntry.data,
+      freshCachedEntry.source || "Cached provider",
+      true
+    );
   }
 
   // Preserve the last real provider series while refreshing. If Yahoo or Twelve
@@ -5879,7 +5979,31 @@ app.get("/candles", async (req, res) => {
     providerErrors.yahoo = error && error.message || String(error);
   }
 
-  // Twelve Data is the first fallback. The previous order preferred Massive,
+  // FMP is a second real-market source and is attempted before the metered
+  // Twelve Data fallback. It supports the same 1m/5m/15m/30m/1h chart set.
+  if (FMP_API_KEY) {
+    try {
+      const fmpCandles = await fetchFmpStockCandles(ticker, tdInterval, outputsize);
+
+      if (tdInterval !== "1day" && !isStockCandleSeriesFreshEnough(fmpCandles, tdInterval)) {
+        throw new Error(
+          `FMP response ended on ${candleSeriesLatestEasternDateKey(fmpCandles) || "an unknown date"}; ` +
+          `expected ${expectedLatestStockCandleDateKey()}.`
+        );
+      }
+
+      return respondWithCandles(
+        fmpCandles,
+        "Financial Modeling Prep fallback",
+        false,
+        { extendedHoursIncluded: false }
+      );
+    } catch (error) {
+      providerErrors.fmp = error && error.message || String(error);
+    }
+  }
+
+  // Twelve Data is the next fallback. The previous order preferred Massive,
   // which is where the isolated $10-$15 false bodies were still entering the
   // chart whenever Yahoo was temporarily unavailable.
   if (
@@ -5950,6 +6074,11 @@ app.get("/candles", async (req, res) => {
       }
     );
   }
+
+  console.warn(
+    `[CANDLES] All real providers failed for ${ticker} ${tdInterval}: ` +
+    JSON.stringify(providerErrors)
+  );
 
   return res.json({
     ticker,
